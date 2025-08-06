@@ -5,6 +5,12 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// 환경변수 확인 로그 추가
+console.log('🔥 환경변수 확인:');
+console.log('OPENAI_API_KEY:', process.env.OPENAI_API_KEY ? '설정됨' : '없음');
+console.log('API 키 시작:', process.env.OPENAI_API_KEY ? process.env.OPENAI_API_KEY.substring(0, 10) + '...' : 'None');
+console.log('PORT:', process.env.PORT);
+
 // CORS 및 JSON 파싱 설정
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -174,8 +180,6 @@ app.post('/api/extract-key-sentences', (req, res) => {
       result.keySentences = extractKeySentences(text, 3);
     }
     
-
-    
     res.json(result);
   } catch (error) {
     console.error('키워드/문장 추출 오류:', error);
@@ -184,18 +188,26 @@ app.post('/api/extract-key-sentences', (req, res) => {
 });
 
 /**
- * LLM 요약 API
+ * LLM 요약 API - 수정된 버전
  */
 app.post('/api/llm-summarize', async (req, res) => {
   try {
     const { text } = req.body;
     
+    console.log('🔥 LLM API 호출됨!'); // 디버깅용 로그
+    console.log(`🔥 요청 텍스트 길이: ${text ? text.length : 0}`);
+    
     if (!text || text.trim().length === 0) {
       return res.status(400).json({ error: '요약할 텍스트를 입력해주세요.' });
     }
     
+    const apiKey = process.env.OPENAI_API_KEY;
+    console.log(`🔥 API 키 확인: ${!!apiKey}, 길이: ${apiKey ? apiKey.length : 0}`);
+    console.log(`🔥 API 키 시작: ${apiKey ? apiKey.substring(0, 10) : 'None'}...`);
+    
     // API 키가 없으면 더미 응답
-    if (!process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY === 'your_openai_api_key_here') {
+    if (!apiKey || apiKey === 'your_openai_api_key_here') {
+      console.log('🔥 API 키가 없음 - 더미 응답 반환');
       const summary = `📝 **요약 결과**
 
 핵심 내용: ${text.substring(0, 80)}...
@@ -207,24 +219,23 @@ app.post('/api/llm-summarize', async (req, res) => {
       return res.json({ summary });
     }
 
-    // SSAFY GMS API 또는 OpenAI API 호출
-    const isGmsApiKey = process.env.OPENAI_API_KEY.startsWith('S13P11C');
+    // SSAFY GMS API 키 패턴 체크
+    const isGmsApiKey = apiKey.startsWith('S13P');
+    
+    // API URL 설정
     const apiUrl = isGmsApiKey 
       ? 'https://gms.ssafy.io/gmsapi/api.openai.com/v1/chat/completions'
       : 'https://api.openai.com/v1/chat/completions';
 
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [
-          {
-            role: 'system',
-            content: `당신은 교육 전문 요약 AI입니다. 선생님의 1시간 강의 내용을 학생들이 이해하기 쉽게 요약해주세요.
+    console.log(`🔥 사용할 API URL: ${apiUrl}`);
+    console.log(`🔥 GMS API 키 여부: ${isGmsApiKey}`);
+
+    const requestBody = {
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `당신은 교육 전문 요약 AI입니다. 선생님의 1시간 강의 내용을 학생들이 이해하기 쉽게 요약해주세요.
 
 요약 형식:
 📚 **주요 학습 내용**
@@ -242,44 +253,115 @@ app.post('/api/llm-summarize', async (req, res) => {
 📝 **정리**
 - 전체 내용을 한 문장으로 요약
 - 다음 학습과의 연결점`
-          },
-          {
-            role: 'user',
-            content: `다음은 선생님이 1시간 동안 진행한 수업 내용입니다. 학생들의 학습을 위해 체계적으로 요약해주세요:\n\n${text}`
-          }
-        ],
-        temperature: 0.3,
-        max_tokens: 500
-      })
+        },
+        {
+          role: 'user',
+          content: `다음은 선생님이 1시간 동안 진행한 수업 내용입니다. 학생들의 학습을 위해 체계적으로 요약해주세요:\n\n${text}`
+        }
+      ],
+      temperature: 0.3,
+      max_tokens: 500
+    };
+
+    console.log('🔥 API 요청 시작...');
+    console.log('🔥 요청 헤더:', {
+      'Authorization': `Bearer ${apiKey.substring(0, 10)}...`,
+      'Content-Type': 'application/json'
     });
+
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(requestBody)
+    });
+    
+    console.log(`🔥 API 응답 상태: ${response.status}`);
+    console.log(`🔥 응답 헤더:`, Object.fromEntries(response.headers.entries()));
     
     if (!response.ok) {
       const errorData = await response.text();
-      console.error('OpenAI API 오류:', response.status, errorData);
-      return res.status(500).json({ error: 'LLM API 호출에 실패했습니다.' });
+      console.error(`🔥 OpenAI API 오류: ${response.status}`);
+      console.error(`🔥 오류 내용: ${errorData}`);
+      console.error(`🔥 요청 URL: ${apiUrl}`);
+      console.error(`🔥 API 키 패턴: ${apiKey ? apiKey.substring(0, 15) + '...' : 'None'}`);
+      
+      return res.status(500).json({ 
+        error: `LLM API 호출 실패 (HTTP ${response.status})`,
+        details: errorData.substring(0, 200),
+        apiUrl: apiUrl,
+        isGmsApi: isGmsApiKey
+      });
     }
     
     const data = await response.json();
-    const summary = data.choices[0]?.message?.content;
+    console.log(`🔥 응답 데이터 구조:`, {
+      hasChoices: !!data.choices,
+      choicesLength: data.choices?.length,
+      hasMessage: !!data.choices?.[0]?.message,
+      hasContent: !!data.choices?.[0]?.message?.content
+    });
+    
+    const summary = data.choices?.[0]?.message?.content;
+    
+    console.log(`🔥 요약 생성 성공: ${!!summary}`);
+    console.log(`🔥 요약 길이: ${summary ? summary.length : 0}`);
     
     if (!summary) {
-      return res.status(500).json({ error: '요약 생성에 실패했습니다.' });
+      console.error('🔥 요약 내용이 비어있음');
+      console.error('🔥 전체 응답:', JSON.stringify(data, null, 2));
+      return res.status(500).json({ 
+        error: '요약 생성에 실패했습니다.',
+        responseData: data
+      });
     }
     
-
-    
+    console.log('🔥 요약 응답 전송 완료');
     res.json({ summary: summary.trim() });
+    
   } catch (error) {
-    console.error('LLM 요약 오류:', error);
-    res.status(500).json({ error: 'LLM 요약 중 오류가 발생했습니다.' });
+    console.error('🔥 LLM 요약 오류:', error.message);
+    console.error('🔥 스택 트레이스:', error.stack);
+    console.error('🔥 오류 타입:', error.constructor.name);
+    
+    // fetch 관련 오류인지 확인
+    if (error.message.includes('fetch')) {
+      console.error('🔥 네트워크 오류 감지');
+      return res.status(500).json({ 
+        error: 'API 호출 중 네트워크 오류가 발생했습니다.',
+        details: error.message 
+      });
+    }
+    
+    res.status(500).json({ 
+      error: `LLM 요약 중 오류가 발생했습니다.`,
+      details: error.message 
+    });
   }
 });
 
-
+/**
+ * 헬스 체크 API
+ */
+app.get('/', (req, res) => {
+  res.json({
+    message: '🚀 문서요약 API 서버 실행 중',
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    env: {
+      port: PORT,
+      hasApiKey: !!process.env.OPENAI_API_KEY,
+      apiKeyPattern: process.env.OPENAI_API_KEY ? process.env.OPENAI_API_KEY.substring(0, 10) + '...' : 'None'
+    }
+  });
+});
 
 /**
  * 서버 시작
  */
 app.listen(PORT, () => {
   console.log(`🚀 문서요약 API 서버 실행 중: http://localhost:${PORT}`);
-}); 
+  console.log(`🔍 헬스 체크: http://localhost:${PORT}/`);
+});
