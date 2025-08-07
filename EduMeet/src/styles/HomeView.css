@@ -250,12 +250,20 @@
 }
 
 .view-more {
-  font-size: var(--font-size-base);
+  color: white;
   font-weight: 600;
-  padding: var(--spacing-sm) var(--spacing-lg);
-  border: 2px solid var(--text-inverse);
-  border-radius: 25px;
+  font-size: 1rem;
+  cursor: pointer;
+  padding: 0.5rem 1rem;
+  background: rgba(0, 0, 0, 0.7);
+  border-radius: var(--radius-md);
   transition: all var(--transition-normal);
+  user-select: none;
+}
+
+.view-more:hover {
+  background: rgba(0, 0, 0, 0.9);
+  transform: scale(1.05);
 }
 
 .draggable-card:hover .view-more {
@@ -1605,4 +1613,48 @@
     flex-direction: column; 
     gap: var(--spacing-xs); 
   }
+}
+
+/* 카드 액션 컨테이너 */
+.card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 삭제 버튼 */
+.delete-btn {
+  background: none;
+  border: none;
+  color: #ef4444;
+  font-size: 18px;
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 6px;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 36px;
+  height: 36px;
+}
+
+.delete-btn:hover {
+  background-color: #fef2f2;
+  color: #dc2626;
+  transform: scale(1.1);
+}
+
+.delete-btn:active {
+  transform: scale(0.95);
+}
+
+/* 다크모드에서 삭제 버튼 */
+.dark-mode .delete-btn {
+  color: #f87171;
+}
+
+.dark-mode .delete-btn:hover {
+  background-color: #7f1d1d;
+  color: #fca5a5;
 }  

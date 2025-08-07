@@ -4,7 +4,7 @@
       <img :src="cardImage" :alt="card.title" />
       <div class="card-overlay">
         <div class="card-hover-content">
-          <span class="view-more">자세히 보기</span>
+          <span class="view-more" @click.stop="handleViewDetail">자세히 보기</span>
         </div>
       </div>
       <div class="card-badge">{{ card.tags[0] }}</div>
@@ -20,13 +20,30 @@
           <span class="stat">⭐ 4.8</span>
           <span class="stat">👥 1.2k</span>
         </div>
-        <button 
-          class="enroll-btn" 
-          :class="{ 'create-btn': isMyCreatedClass }"
-          @click="handleButtonClick"
-        >
-          {{ isMyCreatedClass ? '수업 생성' : '입장하기' }}
-        </button>
+        <div class="card-actions">
+          <button 
+            class="enroll-btn" 
+            :class="{ 'create-btn': isMyCreatedClass }"
+            @click="handleButtonClick"
+          >
+            {{ isMyCreatedClass ? '수업 생성' : '입장하기' }}
+          </button>
+          <button 
+            v-if="isMyCreatedClass"
+            class="delete-btn" 
+            @click="handleDeleteClick"
+            title="클래스 삭제"
+          >
+            🗑️
+          </button>
+          <button 
+            class="members-btn" 
+            @click="handleViewMembers"
+            title="학생 목록 보기"
+          >
+            👥
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -51,7 +68,7 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits(['enroll', 'createClass'])
+const emit = defineEmits(['enroll', 'createClass', 'deleteClass', 'joinClass', 'viewDetail', 'viewMembers'])
 
 const cardImage = computed(() => {
   // card.image가 없거나 빈 문자열이거나 유효하지 않은 경우 기본 이미지 사용
@@ -61,21 +78,83 @@ const cardImage = computed(() => {
   return props.card.image
 })
 
+const handleViewDetail = () => {
+  console.log('🔍 ClassCard - 자세히 보기 클릭:', props.card)
+  emit('viewDetail', props.card)
+}
+
 const handleButtonClick = () => {
+  console.log('🔍 ClassCard - props.card:', props.card)
+  console.log('🔍 ClassCard - props.card.id:', props.card.id)
+  console.log('🔍 ClassCard - props.card.classId:', props.card.classId)
+  console.log('🔍 ClassCard - 모든 키:', Object.keys(props.card))
+  console.log('🔍 ClassCard - props.isMyCreatedClass:', props.isMyCreatedClass)
+  
+  // 백엔드 데이터에서 실제 ID 키를 찾기
+  const classId = props.card.id || props.card.classId || props.card.classroomId || props.card._id
+  
   if (props.isMyCreatedClass) {
     // 내가 만든 반이면 수업 생성 이벤트 발생
     emit('createClass', {
-      classId: props.card.id,
+      classId: classId,
       className: props.card.title
     })
   } else {
-    // 내가 속한 반이면 기존 입장 이벤트 발생
-    emit('enroll', props.card.id)
+    // 내가 속한 반이면 수업 참여 이벤트 발생
+    emit('joinClass', {
+      classId: classId,
+      className: props.card.title,
+      classDescription: props.card.description
+    })
   }
+}
+
+const handleDeleteClick = () => {
+  console.log('🔍 ClassCard - props.card:', props.card)
+  console.log('🔍 ClassCard - props.card.id:', props.card.id)
+  console.log('🔍 ClassCard - props.card.classId:', props.card.classId)
+  console.log('🔍 ClassCard - 모든 키:', Object.keys(props.card))
+  
+  if (confirm(`"${props.card.title}" 클래스를 삭제하시겠습니까?\n\n이 작업은 되돌릴 수 없습니다.`)) {
+    // id가 없으면 classId를 사용
+    const classId = props.card.id || props.card.classId
+    console.log('🔍 ClassCard - 삭제할 classId:', classId)
+    emit('deleteClass', classId)
+  }
+}
+
+const handleViewMembers = () => {
+  console.log('🔍 ClassCard - 학생 목록 보기 클릭:', props.card)
+  const classId = props.card.id || props.card.classId || props.card.classroomId || props.card._id
+  emit('viewMembers', {
+    classId: classId,
+    className: props.card.title
+  })
 }
 </script>
 
 <style scoped>
 /* HomeView.css의 카드 관련 스타일을 그대로 사용하기 위해 scoped를 제거하고 
    부모 컴포넌트에서 CSS를 import하도록 설정 */
+/* 학생 목록 버튼 스타일 */
+.members-btn {
+  background: #3b82f6;
+  color: white;
+  border: none;
+  padding: 8px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.2s;
+  margin-left: 8px;
+}
+
+.members-btn:hover {
+  background: #2563eb;
+  transform: translateY(-1px);
+}
+
+.members-btn:active {
+  transform: translateY(0);
+}
 </style> 
