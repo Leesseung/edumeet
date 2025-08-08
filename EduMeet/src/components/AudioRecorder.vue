@@ -1,49 +1,48 @@
 <template>
-  <div class="audio-recorder">
-    <div class="recorder-controls">
-      <button 
-        @click="startRecording" 
-        :disabled="isRecording"
-        class="record-btn start-btn"
-      >
-        🎤 수업 시작
-      </button>
+  <div 
+    v-if="isOpen" 
+    class="audio-recorder-modal"
+    :style="{ left: position.x + 'px', top: position.y + 'px' }"
+    @mousedown="startDrag"
+    @touchstart="startDrag"
+  >
+    <div class="modal-content">
+      <div class="recorder-controls">
+        <button 
+          @click="toggleRecording" 
+          :class="['record-btn', isRecording ? 'stop-btn' : 'start-btn']"
+        >
+          {{ isRecording ? '⏹️ 수업 종료' : '🎤 수업 시작' }}
+        </button>
+      </div>
       
-      <button 
-        @click="stopRecording" 
-        :disabled="!isRecording"
-        class="record-btn stop-btn"
-      >
-        ⏹️ 수업 종료
-      </button>
-    </div>
-    
-    <div v-if="isRecording" class="recording-status">
-      <div class="status-indicator">
-        <span class="recording-dot"></span>
-        녹음 중...
+      <div v-if="isRecording" class="recording-status">
+        <div class="status-indicator">
+          <span class="recording-dot"></span>
+          녹음 중...
+        </div>
+        <div class="recording-time">
+          {{ formatTime(recordingTime) }}
+        </div>
+        <div class="chunk-info">
+          청크 {{ currentChunk }} / {{ totalChunks }}
+        </div>
       </div>
-      <div class="recording-time">
-        {{ formatTime(recordingTime) }}
-      </div>
-      <div class="chunk-info">
-        청크 {{ currentChunk }} / {{ totalChunks }}
-      </div>
-    </div>
-    
-    <div v-if="uploadStatus" class="upload-status">
-      <div class="status-message" :class="uploadStatus.type">
-        {{ uploadStatus.message }}
-      </div>
-      <div v-if="uploadStatus.progress" class="progress-bar">
-        <div class="progress-fill" :style="{ width: uploadStatus.progress + '%' }"></div>
+      
+      <div v-if="uploadStatus" class="upload-status">
+        <div class="status-message" :class="uploadStatus.type">
+          {{ uploadStatus.message }}
+        </div>
+        <div v-if="uploadStatus.progress" class="progress-bar">
+          <div class="progress-fill" :style="{ width: uploadStatus.progress + '%' }"></div>
+        </div>
       </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, onUnmounted, computed } from 'vue'
+import { ref, onUnmounted, onMounted } from 'vue'
 
 const props = defineProps({
   classId: {
@@ -57,10 +56,19 @@ const props = defineProps({
   creatorName: {
     type: String,
     default: ''
+  },
+  isOpen: {
+    type: Boolean,
+    default: true
   }
 })
 
-const emit = defineEmits(['recording-started', 'recording-stopped', 'chunk-uploaded'])
+const emit = defineEmits(['recording-started', 'recording-stopped', 'chunk-uploaded', 'close'])
+
+// 모달 상태
+const position = ref({ x: 50, y: 50 })
+const isDragging = ref(false)
+const dragOffset = ref({ x: 0, y: 0 })
 
 // 녹음 상태
 const isRecording = ref(false)
@@ -69,10 +77,6 @@ const audioChunks = ref([])
 const recordingTime = ref(0)
 const recordingTimer = ref(null)
 const chunkTimer = ref(null)
-
-// WebSocket 관련
-const websocket = ref(null)
-const isWebSocketConnected = ref(false)
 
 // 청크 관련
 const CHUNK_DURATION = 5 * 60 * 1000 // 5분 (밀리초)
@@ -83,68 +87,56 @@ const chunkStartTime = ref(0)
 // 업로드 상태
 const uploadStatus = ref(null)
 
-// WebSocket 연결
-const connectWebSocket = () => {
-  try {
-    // Spring Boot WebSocket 서버 URL
-    const wsUrl = `ws://localhost:8080/ws`
-    websocket.value = new WebSocket(wsUrl)
-    
-    websocket.value.onopen = () => {
-      console.log('🎤 WebSocket 연결 성공')
-      isWebSocketConnected.value = true
-    }
-    
-    websocket.value.onmessage = (event) => {
-      const data = JSON.parse(event.data)
-      console.log('📥 WebSocket 메시지 수신:', data)
-      
-      if (data.type === 'chunk-uploaded') {
-        uploadStatus.value = {
-          type: 'success',
-          message: `청크 ${data.chunkNumber} 업로드 완료`,
-          progress: 100
-        }
-        
-        emit('chunk-uploaded', {
-          chunkNumber: data.chunkNumber,
-          timestamp: data.timestamp
-        })
-        
-        // 3초 후 상태 초기화
-        setTimeout(() => {
-          uploadStatus.value = null
-        }, 3000)
-      } else if (data.type === 'error') {
-        uploadStatus.value = {
-          type: 'error',
-          message: data.message || '전송 실패',
-          progress: 0
-        }
-      }
-    }
-    
-    websocket.value.onerror = (error) => {
-      console.error('🎤 WebSocket 오류:', error)
-      isWebSocketConnected.value = false
-    }
-    
-    websocket.value.onclose = () => {
-      console.log('🎤 WebSocket 연결 종료')
-      isWebSocketConnected.value = false
-    }
-    
-  } catch (error) {
-    console.error('🎤 WebSocket 연결 실패:', error)
+// API 기본 URL
+const API_BASE_URL = 'http://localhost:3001'
+
+// 드래그 시작
+const startDrag = (event) => {
+  event.preventDefault()
+  isDragging.value = true
+  
+  const rect = event.currentTarget.getBoundingClientRect()
+  dragOffset.value = {
+    x: event.clientX - rect.left,
+    y: event.clientY - rect.top
+  }
+  
+  document.addEventListener('mousemove', onDrag)
+  document.addEventListener('mouseup', stopDrag)
+  document.addEventListener('touchmove', onDrag)
+  document.addEventListener('touchend', stopDrag)
+}
+
+// 드래그 중
+const onDrag = (event) => {
+  if (!isDragging.value) return
+  
+  event.preventDefault()
+  
+  const clientX = event.clientX || event.touches[0].clientX
+  const clientY = event.clientY || event.touches[0].clientY
+  
+  position.value = {
+    x: clientX - dragOffset.value.x,
+    y: clientY - dragOffset.value.y
   }
 }
 
-// WebSocket 연결 해제
-const disconnectWebSocket = () => {
-  if (websocket.value) {
-    websocket.value.close()
-    websocket.value = null
-    isWebSocketConnected.value = false
+// 드래그 종료
+const stopDrag = () => {
+  isDragging.value = false
+  document.removeEventListener('mousemove', onDrag)
+  document.removeEventListener('mouseup', stopDrag)
+  document.removeEventListener('touchmove', onDrag)
+  document.removeEventListener('touchend', stopDrag)
+}
+
+// 녹음 토글 (시작/종료)
+const toggleRecording = async () => {
+  if (isRecording.value) {
+    await stopRecording()
+  } else {
+    await startRecording()
   }
 }
 
@@ -160,16 +152,15 @@ const startRecording = async () => {
       } 
     })
     
-    // MP3 인코딩을 위한 설정
+    // WAV 포맷을 위한 설정 (백엔드에서 WAV 파일을 기대하므로)
     const options = {
-      mimeType: 'audio/mp3',
-      audioBitsPerSecond: 128000
+      mimeType: 'audio/wav'
     }
     
-    // MP3가 지원되지 않는 경우 대체 포맷 사용
+    // WAV가 지원되지 않는 경우 대체 포맷 사용
     if (!MediaRecorder.isTypeSupported(options.mimeType)) {
       options.mimeType = 'audio/webm;codecs=opus'
-      console.warn('MP3가 지원되지 않아 WebM/Opus 사용')
+      console.warn('WAV가 지원되지 않아 WebM/Opus 사용')
     }
     
     mediaRecorder.value = new MediaRecorder(stream, options)
@@ -185,9 +176,6 @@ const startRecording = async () => {
     mediaRecorder.value.onstop = () => {
       sendChunk()
     }
-    
-    // WebSocket 연결
-    connectWebSocket()
     
     // 녹음 시작
     mediaRecorder.value.start(1000) // 1초마다 데이터 수집
@@ -223,9 +211,6 @@ const stopRecording = async () => {
     if (audioChunks.value.length > 0) {
       await sendChunk()
     }
-    
-    // WebSocket 연결 해제
-    disconnectWebSocket()
     
     // 백엔드에 수업 종료 알림
     await notifyRecordingStop()
@@ -266,7 +251,7 @@ const stopTimers = () => {
   }
 }
 
-// 청크 전송 (WebSocket 사용)
+// 청크 전송 (HTTP API 사용)
 const sendChunk = async () => {
   if (audioChunks.value.length === 0) return
   
@@ -281,34 +266,45 @@ const sendChunk = async () => {
       type: mediaRecorder.value.mimeType 
     })
     
-    // WebSocket을 통해 청크 데이터 전송
-    if (websocket.value && isWebSocketConnected.value) {
-      const chunkData = {
-        type: 'audio-chunk',
-        classId: props.classId,
-        chunkNumber: currentChunk.value,
-        timestamp: Date.now(),
-        duration: CHUNK_DURATION,
-        audioData: await blobToBase64(audioBlob)
-      }
-      
-      websocket.value.send(JSON.stringify(chunkData))
-      
-      // 진행률 시뮬레이션 (실제로는 서버에서 응답)
-      uploadStatus.value.progress = 50
-      setTimeout(() => {
-        uploadStatus.value.progress = 100
-      }, 1000)
-      
-    } else {
-      throw new Error('WebSocket 연결이 없습니다.')
+    // FormData를 사용하여 파일 업로드
+    const formData = new FormData()
+    formData.append('audio', audioBlob, `chunk_${currentChunk.value}.wav`)
+    
+    // HTTP API를 통해 청크 업로드
+    const response = await fetch(`${API_BASE_URL}/api/class/${props.classId}/update-recording`, {
+      method: 'POST',
+      body: formData
+    })
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
     }
+    
+    const result = await response.json()
+    console.log('✅ 청크 업로드 성공:', result)
+    
+    uploadStatus.value = {
+      type: 'success',
+      message: `청크 ${currentChunk.value} 업로드 완료`,
+      progress: 100
+    }
+    
+    emit('chunk-uploaded', {
+      chunkNumber: currentChunk.value,
+      filename: result.filename,
+      timestamp: Date.now()
+    })
+    
+    // 3초 후 상태 초기화
+    setTimeout(() => {
+      uploadStatus.value = null
+    }, 3000)
     
   } catch (error) {
     console.error('청크 전송 실패:', error)
     uploadStatus.value = {
       type: 'error',
-      message: `청크 ${currentChunk.value} 전송 실패`,
+      message: `청크 ${currentChunk.value} 전송 실패: ${error.message}`,
       progress: 0
     }
   }
@@ -317,23 +313,10 @@ const sendChunk = async () => {
   audioChunks.value = []
 }
 
-// Blob을 Base64로 변환
-const blobToBase64 = (blob) => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => {
-      const base64 = reader.result.split(',')[1] // data:audio/mp3;base64, 부분 제거
-      resolve(base64)
-    }
-    reader.onerror = reject
-    reader.readAsDataURL(blob)
-  })
-}
-
 // 수업 시작 알림
 const notifyRecordingStart = async () => {
   try {
-    await fetch(`/api/class/${props.classId}/start-recording`, {
+    const response = await fetch(`${API_BASE_URL}/api/class/${props.classId}/start-recording`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
@@ -344,6 +327,14 @@ const notifyRecordingStart = async () => {
         startTime: Date.now()
       })
     })
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+    }
+    
+    const result = await response.json()
+    console.log('✅ 수업 시작 알림 성공:', result)
+    
   } catch (error) {
     console.error('수업 시작 알림 실패:', error)
   }
@@ -352,7 +343,7 @@ const notifyRecordingStart = async () => {
 // 수업 종료 알림
 const notifyRecordingStop = async () => {
   try {
-    await fetch(`/api/class/${props.classId}/stop-recording`, {
+    const response = await fetch(`${API_BASE_URL}/api/class/${props.classId}/stop-recording`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
@@ -362,6 +353,14 @@ const notifyRecordingStop = async () => {
         totalChunks: currentChunk.value
       })
     })
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+    }
+    
+    const result = await response.json()
+    console.log('✅ 수업 종료 알림 성공:', result)
+    
   } catch (error) {
     console.error('수업 종료 알림 실패:', error)
   }
@@ -375,37 +374,56 @@ const formatTime = (milliseconds) => {
   return `${minutes.toString().padStart(2, '0')}:${remainingSeconds.toString().padStart(2, '0')}`
 }
 
+// 컴포넌트 마운트 시 초기 위치 설정
+onMounted(() => {
+  // 화면 중앙에 위치
+  const screenWidth = window.innerWidth
+  const screenHeight = window.innerHeight
+  position.value = {
+    x: (screenWidth - 200) / 2,
+    y: (screenHeight - 150) / 2
+  }
+})
+
 // 컴포넌트 언마운트 시 정리
 onUnmounted(() => {
   if (isRecording.value) {
     stopRecording()
   }
-  disconnectWebSocket()
+  stopDrag()
 })
 </script>
 
 <style scoped>
-.audio-recorder {
-  padding: 20px;
-  background: rgba(0, 0, 0, 0.8);
+.audio-recorder-modal {
+  position: fixed;
+  width: 200px;
   border-radius: 12px;
   color: white;
+  z-index: 1000;
+  user-select: none;
+  cursor: move;
+}
+
+.modal-content {
+  padding: 16px;
 }
 
 .recorder-controls {
   display: flex;
-  gap: 12px;
-  margin-bottom: 16px;
+  justify-content: center;
+  margin-bottom: 12px;
 }
 
 .record-btn {
-  padding: 12px 24px;
+  padding: 10px 20px;
   border: none;
   border-radius: 8px;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
   cursor: pointer;
   transition: all 0.3s ease;
+  min-width: 100px;
 }
 
 .start-btn {
@@ -413,7 +431,7 @@ onUnmounted(() => {
   color: white;
 }
 
-.start-btn:hover:not(:disabled) {
+.start-btn:hover {
   transform: translateY(-2px);
   box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
 }
@@ -423,34 +441,30 @@ onUnmounted(() => {
   color: white;
 }
 
-.stop-btn:hover:not(:disabled) {
+.stop-btn:hover {
   transform: translateY(-2px);
   box-shadow: 0 4px 15px rgba(239, 68, 68, 0.3);
 }
 
-.record-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-  transform: none;
-}
-
 .recording-status {
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 16px;
-  margin-bottom: 16px;
+  gap: 8px;
+  margin-bottom: 12px;
 }
 
 .status-indicator {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   font-weight: 600;
+  font-size: 12px;
 }
 
 .recording-dot {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
   background: #ef4444;
   border-radius: 50%;
   animation: pulse 1s infinite;
@@ -463,22 +477,23 @@ onUnmounted(() => {
 
 .recording-time {
   font-family: monospace;
-  font-size: 18px;
+  font-size: 16px;
   font-weight: 600;
 }
 
 .chunk-info {
-  font-size: 12px;
+  font-size: 11px;
   opacity: 0.8;
 }
 
 .upload-status {
-  margin-top: 12px;
+  margin-top: 8px;
 }
 
 .status-message {
-  font-size: 14px;
-  margin-bottom: 8px;
+  font-size: 12px;
+  margin-bottom: 6px;
+  text-align: center;
 }
 
 .status-message.uploading {
@@ -495,7 +510,7 @@ onUnmounted(() => {
 
 .progress-bar {
   width: 100%;
-  height: 4px;
+  height: 3px;
   background: rgba(255, 255, 255, 0.2);
   border-radius: 2px;
   overflow: hidden;
@@ -505,5 +520,17 @@ onUnmounted(() => {
   height: 100%;
   background: linear-gradient(90deg, #10b981, #059669);
   transition: width 0.3s ease;
+}
+
+/* 드래그 중일 때 스타일 */
+.audio-recorder-modal:active {
+  cursor: grabbing;
+}
+
+/* 모바일 터치 지원 */
+@media (max-width: 768px) {
+  .audio-recorder-modal {
+    width: 180px;
+  }
 }
 </style>
