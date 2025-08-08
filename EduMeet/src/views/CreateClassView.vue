@@ -48,34 +48,28 @@
           <p>반 목록을 불러오는 중...</p>
         </div>
 
-        <!-- 빈 상태 -->
-        <div v-else-if="currentClasses.length === 0 && !listError" class="empty-state">
-          <div class="empty-icon">
-            <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M2 3H6L7.68 14.39C7.77 14.99 8.31 15.44 8.92 15.44H19.5C20.1 15.44 20.64 14.99 20.73 14.39L22 6H6"/>
-            </svg>
-          </div>
-          <h3>{{ activeTab === 'created' ? '아직 만든 반이 없어요' : '아직 속한 반이 없어요' }}</h3>
-          <p>{{ activeTab === 'created' ? '위에서 새로운 반을 만들어보세요!' : '친구가 만든 반에 참여해보세요!' }}</p>
-        </div>
-
-        <!-- 반 목록 -->
-        <div v-else class="class-cards-container">
-          <div class="class-cards-grid">
-            <div 
-              v-for="(classItem, idx) in currentClasses" 
-              :key="`${activeTab}-${classItem.id}-${classItem.title}`"
-              class="class-card-item"
-              :class="{ 'selected': selectedClass?.id === classItem.id }"
-              @click="selectClass(classItem)"
-            >
-              <ClassCard
-                :card="classItem"
-                :animationDelay="idx * 0.1"
-                :isMyCreatedClass="activeTab === 'created'"
-                @enroll="goToVideoRoom"
-                @createClass="handleCreateClass"
-              />
+        <!-- 카드 섹션 -->
+        <div class="cards-section">
+          <div class="cards-scroll-container">
+            <div class="class-cards-grid">
+              <div 
+                v-for="(classItem, idx) in currentClasses" 
+                :key="`${activeTab}-${classItem.id}-${classItem.title}`"
+                class="class-card-item"
+                @click="selectClass(classItem)"
+              >
+                <ClassCard
+                  :card="classItem"
+                  :animationDelay="idx * 0.1"
+                  :isMyCreatedClass="activeTab === 'created'"
+                  @enroll="goToVideoRoom"
+                  @joinClass="handleJoinClass"
+                  @createClass="handleCreateClass"
+                  @deleteClass="handleDeleteClass"
+                  @viewDetail="selectClass"
+                  @viewMembers="handleViewMembers"
+                />
+              </div>
             </div>
           </div>
         </div>
@@ -89,6 +83,15 @@
           </svg>
           {{ listError }}
         </div>
+
+        <!-- 빈 상태 -->
+        <div v-if="currentClasses.length === 0 && !listError" class="empty-state">
+          <div class="empty-icon">
+            {{ activeTab === 'created' ? '📚' : '👥' }}
+          </div>
+          <h3>{{ activeTab === 'created' ? '아직 만든 반이 없어요' : '아직 속한 반이 없어요' }}</h3>
+          <p>{{ activeTab === 'created' ? '위에서 새로운 반을 만들어보세요!' : '친구가 만든 반에 참여해보세요!' }}</p>
+        </div>
       </div>
 
       <!-- 클래스 정보 (우측) -->
@@ -96,7 +99,7 @@
         <div v-if="selectedClass" class="class-info-wrapper">
           <ClassInfo 
             :classData="selectedClass"
-            @enter-class="goToVideoRoom"
+            :isMyCreatedClass="activeTab === 'created'" @enter-class="goToVideoRoom"
             @view-details="viewClassDetails"
           />
         </div>
@@ -123,12 +126,31 @@
       @created="handleClassCreated"
     />
 
+    <!-- 수업 참여 모달 -->
+    <JoinClassModal
+      :isOpen="isJoinModalOpen"
+      :className="selectedClassForJoin?.className || ''"
+      :classDescription="selectedClassForJoin?.classDescription || ''"
+      :classId="selectedClassForJoin?.classId || ''"
+      @close="closeJoinModal"
+      @join="handleJoinClassConfirm"
+    />
+
     <!-- 수업 생성 모달 -->
     <CreateClassModal
       :isOpen="showCreateClassModal"
       :defaultClassName="pendingClassData?.className || ''"
+      :classId="pendingClassData?.classId || ''"
       @close="handleCreateClassModalClose"
       @create="handleCreateClassConfirm"
+    />
+
+    <!-- 학생 목록 모달 -->
+    <MembersModal
+      :isVisible="isMembersModalOpen"
+      :classId="selectedClassForMembers?.classId || ''"
+      :className="selectedClassForMembers?.className || ''"
+      @close="closeMembersModal"
     />
   </div>
 </template>
@@ -140,6 +162,8 @@ import { useClassStore } from '@/stores/class'
 import ClassCard from '../components/ClassCard.vue'
 import CreateClassForm from '../components/CreateClassForm.vue'
 import CreateClassModal from '../components/CreateClassModal.vue'
+import JoinClassModal from '../components/JoinClassModal.vue'
+import MembersModal from '../components/MembersModal.vue'
 import ClassInfo from '../components/ClassInfo.vue'
 import '../styles/ClassRelated.css'
 
@@ -149,19 +173,20 @@ const selectedClass = ref(null)
 const showCreateClassModal = ref(false)
 const pendingClassData = ref(null)
 
+// 수업 참여 모달 관련 상태
+const isJoinModalOpen = ref(false)
+const selectedClassForJoin = ref(null)
+
+// 학생 목록 모달 관련 상태
+const isMembersModalOpen = ref(false)
+const selectedClassForMembers = ref(null)
+
 const router = useRouter()
 const classStore = useClassStore()
 
 // 페이지 진입 시 목록 로드
 onMounted(async () => {
-  try {
-    listError.value = ''
-    await classStore.fetchMyCreatedClasses()
-    await classStore.fetchMyJoinedClasses()
-  } catch (error) {
-    console.error('클래스 목록 로드 에러:', error)
-    listError.value = '클래스 목록을 불러오는 데 실패했습니다.'
-  }
+  await loadClasses()
 })
 
 // 현재 활성화된 탭에 따른 반 목록 계산
@@ -189,6 +214,39 @@ function goToVideoRoom(classId) {
   router.push(`/class/${classId}/video`);
 }
 
+// ClassCard의 joinClass 이벤트로 호출됨 (내가 속한 반의 수업 참여)
+function handleJoinClass(classData) {
+  console.log('🔍 handleJoinClass - classData:', classData)
+  selectedClassForJoin.value = classData
+  isJoinModalOpen.value = true
+}
+
+// 수업 참여 모달 닫기
+function closeJoinModal() {
+  isJoinModalOpen.value = false
+  selectedClassForJoin.value = null
+}
+
+// 수업 참여 확인 처리
+function handleJoinClassConfirm(joinData) {
+  console.log('수업 참여 데이터:', joinData)
+  
+  // 화상 수업 페이지로 이동
+  const queryParams = {
+    roomName: joinData.roomName,
+    className: joinData.className,
+    participantName: joinData.participantName,
+    isCreator: 'false' // 참여자는 생성자가 아님
+  }
+  
+  // URL 쿼리 파라미터로 데이터 전달
+  const queryString = new URLSearchParams(queryParams).toString()
+  router.push(`/class/${joinData.classId}/video?${queryString}`)
+  
+  // 모달 닫기
+  closeJoinModal()
+}
+
 // ClassCard의 createClass 이벤트로 호출됨 (내가 만든 반의 수업 생성)
 function handleCreateClass(classData) {
   // 모달을 열고 클래스 데이터를 저장
@@ -198,9 +256,11 @@ function handleCreateClass(classData) {
 
 // 모달에서 수업 생성 확인 시 호출됨
 function handleCreateClassConfirm(modalData) {
+  console.log('🔍 handleCreateClassConfirm - modalData:', modalData)
+  
   // ClassVideoRoomView로 이동하면서 방 이름은 roomName, 제목은 className으로 설정
   router.push({
-    path: `/class/${pendingClassData.value.classId}/video`,
+    path: `/class/${modalData.classId}/video`,
     query: {
       roomName: modalData.roomName,
       className: modalData.className, // className을 제목으로 사용
@@ -228,6 +288,68 @@ function handleClassCreated(newClass) {
   showCreateForm.value = false;
   // 새로 생성된 반을 선택
   selectedClass.value = newClass;
+}
+
+// 클래스 목록 새로고침 함수
+async function loadClasses() {
+  try {
+    listError.value = ''
+    await classStore.fetchMyCreatedClasses()
+    await classStore.fetchMyJoinedClasses()
+    
+    // 디버깅: 클래스 데이터 구조 확인
+    console.log('🔍 Created Classes:', classStore.getMyCreatedClasses)
+    console.log('🔍 Joined Classes:', classStore.getMyJoinedClasses)
+    
+    if (classStore.getMyCreatedClasses.length > 0) {
+      console.log('🔍 First Created Class:', classStore.getMyCreatedClasses[0])
+      console.log('🔍 First Created Class Keys:', Object.keys(classStore.getMyCreatedClasses[0]))
+    }
+  } catch (error) {
+    console.error('클래스 목록 로드 에러:', error)
+    listError.value = '클래스 목록을 불러오는 데 실패했습니다.'
+  }
+}
+
+// 클래스 삭제 처리
+async function handleDeleteClass(classId) {
+  console.log('🔍 CreateClassView - 삭제할 classId:', classId)
+  console.log('🔍 CreateClassView - classId 타입:', typeof classId)
+  
+  if (!classId) {
+    alert('클래스 ID가 없습니다. 다시 시도해주세요.')
+    return
+  }
+  
+  try {
+    await classStore.deleteClass(classId)
+    
+    // 삭제 성공 후 목록 새로고침
+    await loadClasses()
+    
+    // 삭제된 클래스가 현재 선택된 클래스였다면 선택 해제
+    if (selectedClass.value?.id === classId || selectedClass.value?.classId === classId) {
+      selectedClass.value = null
+    }
+    
+    alert('클래스가 성공적으로 삭제되었습니다.')
+  } catch (error) {
+    console.error('클래스 삭제 실패:', error)
+    alert('클래스 삭제에 실패했습니다. 다시 시도해주세요.')
+  }
+}
+
+// 학생 목록 모달 열기
+function handleViewMembers(classData) {
+  console.log('학생 목록 조회:', classData)
+  selectedClassForMembers.value = classData
+  isMembersModalOpen.value = true
+}
+
+// 학생 목록 모달 닫기
+function closeMembersModal() {
+  isMembersModalOpen.value = false
+  selectedClassForMembers.value = null
 }
 </script>
 
