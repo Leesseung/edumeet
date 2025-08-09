@@ -8,18 +8,48 @@
   >
     <div class="modal-content">
       <div class="recorder-controls">
+        <!-- 녹음 시작 버튼 -->
         <button 
-          @click="toggleRecording" 
-          :class="['record-btn', isRecording ? 'stop-btn' : 'start-btn']"
+          v-if="!isRecording && !isPaused && !hasRecordedData"
+          @click="startRecording" 
+          class="record-btn start-btn"
         >
-          {{ isRecording ? '⏹️ 수업 종료' : '🎤 수업 시작' }}
+          🎤 수업 시작
+        </button>
+        
+        <!-- 정지 버튼 (녹음 중일 때만) -->
+        <button 
+          v-if="isRecording && !isPaused"
+          @click="pauseRecording" 
+          class="record-btn pause-btn"
+        >
+          ⏸️ 정지
+        </button>
+        
+        <!-- 재개 버튼 -->
+        <button 
+          v-if="isPaused"
+          @click="resumeRecording" 
+          class="record-btn resume-btn"
+        >
+          ▶️ 재개
+        </button>
+        
+        <!-- 문서 요약 버튼 -->
+        <button 
+          v-if="isPaused"
+          @click="generateSummary" 
+          :disabled="isGeneratingSummary"
+          class="record-btn summary-btn"
+        >
+          {{ isGeneratingSummary ? '📝 요약 생성 중...' : '📝 문서 요약' }}
         </button>
       </div>
       
-      <div v-if="isRecording" class="recording-status">
+      <div v-if="isRecording || isPaused" class="recording-status">
         <div class="status-indicator">
-          <span class="recording-dot"></span>
-          녹음 중...
+          <span class="recording-dot" :class="{ 'paused': isPaused }"></span>
+          {{ isPaused ? '정지됨' : '녹음 중...' }}
         </div>
         <div class="recording-time">
           {{ formatTime(recordingTime) }}
@@ -35,6 +65,12 @@
         </div>
         <div v-if="uploadStatus.progress" class="progress-bar">
           <div class="progress-fill" :style="{ width: uploadStatus.progress + '%' }"></div>
+        </div>
+      </div>
+      
+      <div v-if="summaryStatus" class="summary-status">
+        <div class="status-message" :class="summaryStatus.type">
+          {{ summaryStatus.message }}
         </div>
       </div>
     </div>
@@ -72,11 +108,13 @@ const dragOffset = ref({ x: 0, y: 0 })
 
 // 녹음 상태
 const isRecording = ref(false)
+const isPaused = ref(false)
 const mediaRecorder = ref(null)
 const audioChunks = ref([])
 const recordingTime = ref(0)
 const recordingTimer = ref(null)
 const chunkTimer = ref(null)
+const hasRecordedData = ref(false)
 
 // 청크 관련
 const CHUNK_DURATION = 5 * 60 * 1000 // 5분 (밀리초)
@@ -86,6 +124,8 @@ const chunkStartTime = ref(0)
 
 // 업로드 상태
 const uploadStatus = ref(null)
+const summaryStatus = ref(null)
+const isGeneratingSummary = ref(false)
 
 // API 기본 URL
 const API_BASE_URL = 'http://localhost:3001'
@@ -131,15 +171,6 @@ const stopDrag = () => {
   document.removeEventListener('touchend', stopDrag)
 }
 
-// 녹음 토글 (시작/종료)
-const toggleRecording = async () => {
-  if (isRecording.value) {
-    await stopRecording()
-  } else {
-    await startRecording()
-  }
-}
-
 // 녹음 시작
 const startRecording = async () => {
   try {
@@ -172,14 +203,10 @@ const startRecording = async () => {
       }
     }
     
-    // 청크 전송
-    mediaRecorder.value.onstop = () => {
-      sendChunk()
-    }
-    
     // 녹음 시작
     mediaRecorder.value.start(1000) // 1초마다 데이터 수집
     isRecording.value = true
+    isPaused.value = false
     recordingTime.value = 0
     currentChunk.value = 1
     chunkStartTime.value = Date.now()
@@ -198,24 +225,23 @@ const startRecording = async () => {
   }
 }
 
-// 녹음 종료
-const stopRecording = async () => {
+// 녹음 정지 (일시정지)
+const pauseRecording = () => {
   if (mediaRecorder.value && isRecording.value) {
-    mediaRecorder.value.stop()
-    mediaRecorder.value.stream.getTracks().forEach(track => track.stop())
-    
+    mediaRecorder.value.pause()
     isRecording.value = false
+    isPaused.value = true
     stopTimers()
-    
-    // 마지막 청크 전송
-    if (audioChunks.value.length > 0) {
-      await sendChunk()
-    }
-    
-    // 백엔드에 수업 종료 알림
-    await notifyRecordingStop()
-    
-    emit('recording-stopped')
+  }
+}
+
+// 녹음 재개
+const resumeRecording = () => {
+  if (mediaRecorder.value && isPaused.value) {
+    mediaRecorder.value.resume()
+    isRecording.value = true
+    isPaused.value = false
+    startTimers()
   }
 }
 
@@ -232,7 +258,12 @@ const startTimers = () => {
       // 현재 청크 종료 및 새 청크 시작
       if (mediaRecorder.value) {
         mediaRecorder.value.stop()
-        mediaRecorder.value.start(1000)
+        // 청크 전송 후 새 녹음 시작
+        sendChunk().then(() => {
+          if (isRecording.value && mediaRecorder.value) {
+            mediaRecorder.value.start(1000)
+          }
+        })
       }
       currentChunk.value++
     }
@@ -313,6 +344,55 @@ const sendChunk = async () => {
   audioChunks.value = []
 }
 
+// 문서 요약 생성
+const generateSummary = async () => {
+  try {
+    isGeneratingSummary.value = true
+    summaryStatus.value = {
+      type: 'uploading',
+      message: '문서 요약 생성 중...'
+    }
+    
+    // 백엔드에 문서 요약 요청
+    const response = await fetch(`${API_BASE_URL}/api/class/${props.classId}/stop-recording`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        totalChunks: currentChunk.value,
+        generateSummary: true
+      })
+    })
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+    }
+    
+    const result = await response.json()
+    console.log('✅ 문서 요약 성공:', result)
+    
+    summaryStatus.value = {
+      type: 'success',
+      message: '문서 요약이 완료되었습니다!'
+    }
+    
+    // 5초 후 상태 초기화
+    setTimeout(() => {
+      summaryStatus.value = null
+    }, 5000)
+    
+  } catch (error) {
+    console.error('문서 요약 실패:', error)
+    summaryStatus.value = {
+      type: 'error',
+      message: `문서 요약 실패: ${error.message}`
+    }
+  } finally {
+    isGeneratingSummary.value = false
+  }
+}
+
 // 수업 시작 알림
 const notifyRecordingStart = async () => {
   try {
@@ -340,32 +420,6 @@ const notifyRecordingStart = async () => {
   }
 }
 
-// 수업 종료 알림
-const notifyRecordingStop = async () => {
-  try {
-    const response = await fetch(`${API_BASE_URL}/api/class/${props.classId}/stop-recording`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        endTime: Date.now(),
-        totalChunks: currentChunk.value
-      })
-    })
-    
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
-    }
-    
-    const result = await response.json()
-    console.log('✅ 수업 종료 알림 성공:', result)
-    
-  } catch (error) {
-    console.error('수업 종료 알림 실패:', error)
-  }
-}
-
 // 시간 포맷팅
 const formatTime = (milliseconds) => {
   const seconds = Math.floor(milliseconds / 1000)
@@ -387,8 +441,13 @@ onMounted(() => {
 
 // 컴포넌트 언마운트 시 정리
 onUnmounted(() => {
-  if (isRecording.value) {
-    stopRecording()
+  if (isRecording.value || isPaused.value) {
+    // 녹음 중이거나 정지된 상태라면 정리
+    if (mediaRecorder.value) {
+      mediaRecorder.value.stop()
+      mediaRecorder.value.stream.getTracks().forEach(track => track.stop())
+    }
+    stopTimers()
   }
   stopDrag()
 })
@@ -398,8 +457,10 @@ onUnmounted(() => {
 .audio-recorder-modal {
   position: fixed;
   width: 200px;
+  background: rgba(0, 0, 0, 0.8);
   border-radius: 12px;
   color: white;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
   z-index: 1000;
   user-select: none;
   cursor: move;
@@ -411,7 +472,8 @@ onUnmounted(() => {
 
 .recorder-controls {
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  gap: 8px;
   margin-bottom: 12px;
 }
 
@@ -436,14 +498,40 @@ onUnmounted(() => {
   box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
 }
 
-.stop-btn {
-  background: linear-gradient(135deg, #ef4444, #dc2626);
+.pause-btn {
+  background: linear-gradient(135deg, #f59e0b, #d97706);
   color: white;
 }
 
-.stop-btn:hover {
+.pause-btn:hover {
   transform: translateY(-2px);
-  box-shadow: 0 4px 15px rgba(239, 68, 68, 0.3);
+  box-shadow: 0 4px 15px rgba(245, 158, 11, 0.3);
+}
+
+.resume-btn {
+  background: linear-gradient(135deg, #3b82f6, #2563eb);
+  color: white;
+}
+
+.resume-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 15px rgba(59, 130, 246, 0.3);
+}
+
+.summary-btn {
+  background: linear-gradient(135deg, #8b5cf6, #7c3aed);
+  color: white;
+}
+
+.summary-btn:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 15px rgba(139, 92, 246, 0.3);
+}
+
+.summary-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
 }
 
 .recording-status {
@@ -470,6 +558,11 @@ onUnmounted(() => {
   animation: pulse 1s infinite;
 }
 
+.recording-dot.paused {
+  background: #f59e0b;
+  animation: none;
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }
@@ -486,7 +579,7 @@ onUnmounted(() => {
   opacity: 0.8;
 }
 
-.upload-status {
+.upload-status, .summary-status {
   margin-top: 8px;
 }
 

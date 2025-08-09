@@ -28,7 +28,9 @@ const AUDIO_BASE_PATH=path.join(__dirname, "audio");
 //현재 __dirpath  C:\workspace\fronted\edumeet_frontend\backend    
 console.log("현재 __dirpath " , __dirname);
 //console.log("현재 AUDIO_BASE_PATH" , AUDIO_BASE_PATH);
+
 // AUDIO_BASE_PATH C:\workspace\fronted\edumeet_frontend\backend\audio
+
 
 app.post("/api/class/:classId/start-recording", (req, res) => {
   const { classId } = req.params;
@@ -36,7 +38,9 @@ app.post("/api/class/:classId/start-recording", (req, res) => {
   const classDir = path.join(AUDIO_BASE_PATH, classId);
   console.log("classDir 입니다 : ", classDir);
   fs.mkdirSync(classDir, { recursive: true });
+
   recordingState.set(classId, {recording:true});
+
   res.status(200).json({ message: "녹음 저장 시작 준비 완료" });
 });
 
@@ -45,7 +49,9 @@ const storage = multer.diskStorage({
   destination: function (req, file, cb) {
     const classId = req.params.classId;
     const dir = path.join(__dirname, 'audio', classId);
-    
+
+
+
     // 디렉토리 없으면 생성
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -72,6 +78,7 @@ app.post('/api/class/:classId/update-recording', upload.single('audio'), (req, r
   const classId = req.params.classId;
   const file = req.file;
 
+
   const st = recordingState.get(classId);
   if(!st || !st.recording){
     return res.status(423).json({
@@ -84,9 +91,16 @@ app.post('/api/class/:classId/update-recording', upload.single('audio'), (req, r
     return res.status(400).json({ message: 'No audio file uploaded.' });
   }
 
+
+  if (!file) {
+    return res.status(400).json({ message: 'No audio file uploaded.' });
+  }
+
+
   console.log(`✅ 저장됨: /audio/${classId}/${file.filename}`);
   res.status(200).json({ message: 'Chunk saved successfully.', filename: file.filename });
 });
+
 
 
 app.post("/api/class/:classId/stop-recording", async (req, res) => {
@@ -153,6 +167,24 @@ app.post("/api/class/:classId/stop-recording", async (req, res) => {
   }
 
 
+
+app.post("/api/class/:classId/stop-recording", (req, res) => {
+  const { classId } = req.params;
+  const { totalChunks } = req.body;
+
+  const pyPath = path.join(__dirname, "test_nodejs_api.py");
+  const classDir = path.join(AUDIO_BASE_PATH, classId);
+  const command = `python3 ${pyPath} ${classDir} ${totalChunks}`;
+
+  exec(command, (err, stdout, stderr) => {
+    if (err) {
+      console.error("병합 실패:", stderr);
+      return res.status(500).json({ error: "오디오 병합 실패" });
+    }
+    console.log("병합 결과:", stdout);
+    res.status(200).json({ message: "병합 성공", result: stdout });
+  });
+
 });
 
 
@@ -161,4 +193,7 @@ app.post("/api/class/:classId/stop-recording", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
+
+});
+
 });
