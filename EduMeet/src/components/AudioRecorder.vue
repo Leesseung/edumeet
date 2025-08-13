@@ -117,7 +117,8 @@ const chunkTimer = ref(null)
 const hasRecordedData = ref(false)
 
 // 청크 관련
-const CHUNK_DURATION = 5 * 60 * 1000 // 5분 (밀리초)
+const CHUNK_DURATION = 10 * 1000 // 5초 (밀리초)
+//const CHUNK_DURATION = 5 * 60 * 1000 // 5분 (밀리초)
 const currentChunk = ref(0)
 const totalChunks = ref(0)
 const chunkStartTime = ref(0)
@@ -226,24 +227,63 @@ const startRecording = async () => {
 }
 
 // 녹음 정지 (일시정지)
-const pauseRecording = () => {
-  if (mediaRecorder.value && isRecording.value) {
-    mediaRecorder.value.pause()
-    isRecording.value = false
-    isPaused.value = true
-    stopTimers()
-  }
-}
+// const pauseRecording = () => {
+//   if (mediaRecorder.value && isRecording.value) {
+//     mediaRecorder.value.pause()
+//     isRecording.value = false
+//     isPaused.value = true
+//     stopTimers()
+//   }
+// }
 
-// 녹음 재개
-const resumeRecording = () => {
-  if (mediaRecorder.value && isPaused.value) {
-    mediaRecorder.value.resume()
-    isRecording.value = true
-    isPaused.value = false
-    startTimers()
+const pauseRecording = async () => {
+  if (mediaRecorder.value && isRecording.value) {
+    mediaRecorder.value.pause();
+    isRecording.value = false;
+    isPaused.value = true;
+    stopTimers();
+    // ✅ 서버에 일시정지 알림
+    try {
+      console.log("Vue에서 ", `${API_BASE_URL}/api/class/${props.classId}/pause-recording`, " 요청");
+      await fetch(`${API_BASE_URL}/api/class/${props.classId}/pause-recording`, {
+        method: 'POST'
+      });
+    } catch (e) {
+      console.error('pause-recording 실패:', e);
+    }
   }
-}
+};
+
+
+
+// // 녹음 재개
+// const resumeRecording = () => {
+//   if (mediaRecorder.value && isPaused.value) {
+//     mediaRecorder.value.resume()
+//     isRecording.value = true
+//     isPaused.value = false
+//     startTimers()
+//   }
+// }
+
+const resumeRecording = async () => {
+  if (mediaRecorder.value && isPaused.value) {
+    mediaRecorder.value.resume();
+    isRecording.value = true;
+    isPaused.value = false;
+    startTimers();
+    // ✅ 서버에 재개 알림
+    try {
+      console.log("Vue에서 ",`${API_BASE_URL}/api/class/${props.classId}/resume-recording`, " 요청");
+      await fetch(`${API_BASE_URL}/api/class/${props.classId}/resume-recording`, {
+        method: 'POST'
+      });
+    } catch (e) {
+      console.error('resume-recording 실패:', e);
+    }
+  }
+};
+
 
 // 타이머 시작
 const startTimers = () => {
@@ -396,6 +436,7 @@ const generateSummary = async () => {
 // 수업 시작 알림
 const notifyRecordingStart = async () => {
   try {
+    console.log("Vue 에서", `${API_BASE_URL}/api/class/${props.classId}/start-recording`, " 호출");
     const response = await fetch(`${API_BASE_URL}/api/class/${props.classId}/start-recording`, {
       method: 'POST',
       headers: {
