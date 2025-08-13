@@ -49,14 +49,9 @@ let APPLICATION_SERVER_URL = '';
 let LIVEKIT_URL = '';
 
 function configureUrls() {
-  APPLICATION_SERVER_URL =
-    window.location.hostname === 'localhost'
-      ? 'http://localhost:8080/'
-      : 'https://' + window.location.hostname + ':6443/';
-  LIVEKIT_URL =
-    window.location.hostname === 'localhost'
-      ? 'ws://localhost:7880/'
-      : 'wss://' + window.location.hostname + ':7443/';
+  APPLICATION_SERVER_URL = 'http://localhost:8080/api/v1/meetingroom/'
+      
+  LIVEKIT_URL = 'wss://edumeet-1jz93drq.livekit.cloud'
 }
 configureUrls();
 

@@ -14,7 +14,7 @@
           @click="startRecording" 
           class="record-btn start-btn"
         >
-          🎤 수업 시작
+          🎤 수업 녹화 시작
         </button>
         
         <!-- 정지 버튼 (녹음 중일 때만) -->
@@ -23,7 +23,7 @@
           @click="pauseRecording" 
           class="record-btn pause-btn"
         >
-          ⏸️ 정지
+          ⏸️ 녹화 일시정지
         </button>
         
         <!-- 재개 버튼 -->
@@ -32,7 +32,7 @@
           @click="resumeRecording" 
           class="record-btn resume-btn"
         >
-          ▶️ 재개
+          ▶️ 녹화 재개
         </button>
         
         <!-- 문서 요약 버튼 -->
@@ -42,14 +42,14 @@
           :disabled="isGeneratingSummary"
           class="record-btn summary-btn"
         >
-          {{ isGeneratingSummary ? '📝 요약 생성 중...' : '📝 문서 요약' }}
+          {{ isGeneratingSummary ? '📝 요약 생성 중...' : '📝 문서 요약 생성' }}
         </button>
       </div>
       
       <div v-if="isRecording || isPaused" class="recording-status">
         <div class="status-indicator">
           <span class="recording-dot" :class="{ 'paused': isPaused }"></span>
-          {{ isPaused ? '정지됨' : '녹음 중...' }}
+          {{ isPaused ? '녹화 일시정지됨' : '수업 녹화 중...' }}
         </div>
         <div class="recording-time">
           {{ formatTime(recordingTime) }}
@@ -226,22 +226,28 @@ const startRecording = async () => {
 }
 
 // 녹음 정지 (일시정지)
-const pauseRecording = () => {
+const pauseRecording = async () => {
   if (mediaRecorder.value && isRecording.value) {
     mediaRecorder.value.pause()
     isRecording.value = false
     isPaused.value = true
     stopTimers()
+    
+    // 백엔드에 일시정지 알림
+    await notifyRecordingPause()
   }
 }
 
 // 녹음 재개
-const resumeRecording = () => {
+const resumeRecording = async () => {
   if (mediaRecorder.value && isPaused.value) {
     mediaRecorder.value.resume()
     isRecording.value = true
     isPaused.value = false
     startTimers()
+    
+    // 백엔드에 재개 알림
+    await notifyRecordingResume()
   }
 }
 
@@ -289,7 +295,7 @@ const sendChunk = async () => {
   try {
     uploadStatus.value = {
       type: 'uploading',
-      message: `청크 ${currentChunk.value} 전송 중...`,
+      message: `오디오 청크 ${currentChunk.value} 전송 중...`,
       progress: 0
     }
     
@@ -316,7 +322,7 @@ const sendChunk = async () => {
     
     uploadStatus.value = {
       type: 'success',
-      message: `청크 ${currentChunk.value} 업로드 완료`,
+      message: `오디오 청크 ${currentChunk.value} 업로드 완료`,
       progress: 100
     }
     
@@ -335,7 +341,7 @@ const sendChunk = async () => {
     console.error('청크 전송 실패:', error)
     uploadStatus.value = {
       type: 'error',
-      message: `청크 ${currentChunk.value} 전송 실패: ${error.message}`,
+      message: `오디오 청크 ${currentChunk.value} 전송 실패: ${error.message}`,
       progress: 0
     }
   }
@@ -353,6 +359,11 @@ const generateSummary = async () => {
       message: '문서 요약 생성 중...'
     }
     
+    // 마지막 청크가 있다면 먼저 전송
+    if (audioChunks.value.length > 0) {
+      await sendChunk()
+    }
+    
     // 백엔드에 문서 요약 요청
     const response = await fetch(`${API_BASE_URL}/api/class/${props.classId}/stop-recording`, {
       method: 'POST',
@@ -361,20 +372,41 @@ const generateSummary = async () => {
       },
       body: JSON.stringify({
         totalChunks: currentChunk.value,
-        generateSummary: true
+        generateSummary: true,
+        endTime: Date.now()
       })
     })
     
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+      const errorData = await response.json().catch(() => ({}))
+      throw new Error(errorData.error || `HTTP ${response.status}: ${response.statusText}`)
     }
     
     const result = await response.json()
     console.log('✅ 문서 요약 성공:', result)
     
-    summaryStatus.value = {
-      type: 'success',
-      message: '문서 요약이 완료되었습니다!'
+    if (result.recordingStopped) {
+      summaryStatus.value = {
+        type: 'success',
+        message: '문서 요약이 시작되었습니다! 처리 완료까지 잠시 기다려주세요.'
+      }
+      
+      // 녹음 상태 초기화
+      hasRecordedData.value = false
+      currentChunk.value = 0
+      totalChunks.value = 0
+      recordingTime.value = 0
+      
+      // 스트림 정리
+      if (mediaRecorder.value) {
+        mediaRecorder.value.stream.getTracks().forEach(track => track.stop())
+        mediaRecorder.value = null
+      }
+    } else {
+      summaryStatus.value = {
+        type: 'error',
+        message: '문서 요약 처리에 실패했습니다.'
+      }
     }
     
     // 5초 후 상태 초기화
@@ -420,6 +452,58 @@ const notifyRecordingStart = async () => {
   }
 }
 
+// 일시정지 알림
+const notifyRecordingPause = async () => {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/class/${props.classId}/pause-recording`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        pauseTime: Date.now(),
+        currentChunk: currentChunk.value
+      })
+    })
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+    }
+    
+    const result = await response.json()
+    console.log('✅ 일시정지 알림 성공:', result)
+    
+  } catch (error) {
+    console.error('일시정지 알림 실패:', error)
+  }
+}
+
+// 재개 알림
+const notifyRecordingResume = async () => {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/class/${props.classId}/resume-recording`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        resumeTime: Date.now(),
+        currentChunk: currentChunk.value
+      })
+    })
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+    }
+    
+    const result = await response.json()
+    console.log('✅ 재개 알림 성공:', result)
+    
+  } catch (error) {
+    console.error('재개 알림 실패:', error)
+  }
+}
+
 // 시간 포맷팅
 const formatTime = (milliseconds) => {
   const seconds = Math.floor(milliseconds / 1000)
@@ -440,7 +524,7 @@ onMounted(() => {
 })
 
 // 컴포넌트 언마운트 시 정리
-onUnmounted(() => {
+onUnmounted(async () => {
   if (isRecording.value || isPaused.value) {
     // 녹음 중이거나 정지된 상태라면 정리
     if (mediaRecorder.value) {
@@ -448,6 +532,28 @@ onUnmounted(() => {
       mediaRecorder.value.stream.getTracks().forEach(track => track.stop())
     }
     stopTimers()
+    
+    // 마지막 청크가 있다면 전송
+    if (audioChunks.value.length > 0) {
+      await sendChunk()
+    }
+    
+    // 백엔드에 녹음 종료 알림 (문서 요약 없이)
+    try {
+      await fetch(`${API_BASE_URL}/api/class/${props.classId}/stop-recording`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          totalChunks: currentChunk.value,
+          generateSummary: false,
+          endTime: Date.now()
+        })
+      })
+    } catch (error) {
+      console.error('녹음 종료 알림 실패:', error)
+    }
   }
   stopDrag()
 })
