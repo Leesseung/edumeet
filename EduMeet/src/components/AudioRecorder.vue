@@ -117,7 +117,8 @@ const chunkTimer = ref(null)
 const hasRecordedData = ref(false)
 
 // 청크 관련
-const CHUNK_DURATION = 5 * 60 * 1000 // 5분 (밀리초)
+const CHUNK_DURATION = 60 * 1000 // 5초 (밀리초)
+//const CHUNK_DURATION = 5 * 60 * 1000 // 5분 (밀리초)
 const currentChunk = ref(0)
 const totalChunks = ref(0)
 const chunkStartTime = ref(0)
@@ -250,6 +251,7 @@ const resumeRecording = async () => {
     await notifyRecordingResume()
   }
 }
+
 
 // 타이머 시작
 const startTimers = () => {
@@ -428,6 +430,7 @@ const generateSummary = async () => {
 // 수업 시작 알림
 const notifyRecordingStart = async () => {
   try {
+    console.log("Vue 에서", `${API_BASE_URL}/api/class/${props.classId}/start-recording`, " 호출");
     const response = await fetch(`${API_BASE_URL}/api/class/${props.classId}/start-recording`, {
       method: 'POST',
       headers: {

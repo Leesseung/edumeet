@@ -1,622 +1,843 @@
+# main.py
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
-import re
-import math
-import os
-from collections import Counter
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-import nltk
-import httpx
+import os, re, glob, wave, traceback, subprocess, requests, time, json, shutil
 from dotenv import load_dotenv
-import logging
-
-# KoNLPy 선택적 import (설치되지 않은 경우 대비)
-try:
-    from konlpy.tag import Okt
-    KONLPY_AVAILABLE = True
-except ImportError:
-    logger = logging.getLogger(__name__)
-    logger.warning("KoNLPy가 설치되지 않았습니다. 기본 텍스트 처리 기능만 사용됩니다.")
-    KONLPY_AVAILABLE = False
-    Okt = None
-
-# 환경 변수 로드
-load_dotenv(dotenv_path="config.env")
-
-# 로깅 설정
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# FastAPI 앱 생성
-app = FastAPI(title="교육 텍스트 요약 API", version="1.0.0")
-
-# 요청 로깅 미들웨어
-@app.middleware("http")
-async def log_requests(request, call_next):
-    print(f"🌐 요청: {request.method} {request.url}")
-    logger.info(f"요청: {request.method} {request.url}")
-    
-    try:
-        response = await call_next(request)
-        print(f"🌐 응답: {response.status_code}")
-        logger.info(f"응답: {response.status_code}")
-        return response
-    except Exception as e:
-        print(f"🌐 미들웨어 오류: {e}")
-        logger.error(f"미들웨어 오류: {e}")
-        raise
-
-# CORS 설정
+from openai import OpenAI
+from fpdf import FPDF
+app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
-# 전역 모델 초기화
-embedding_model = None
-okt = None
+HERE = os.path.dirname(os.path.abspath(__file__))
+BASE_AUDIO_DIR = os.environ.get(
+    "AUDIO_BASE_DIR",
+    os.path.normpath(os.path.join(HERE, "..", "backend", "audio"))
+)
+MERGE_OUT_DIR = os.environ.get(
+    "MERGE_OUT_DIR",
+    os.path.normpath(os.path.join(HERE, "..", "FastAPIProject"))
+)
+os.makedirs(MERGE_OUT_DIR, exist_ok=True)
 
-@app.on_event("startup")
-async def startup_event():
-    """앱 시작 시 모델 로드"""
-    global embedding_model, okt
+def _numeric_key(path: str) -> int:
+    """audio_12.wav -> 12 정렬키"""
+    name = os.path.basename(path)
+    m = re.search(r"(\d+)", name)
+    return int(m.group(1)) if m else 0
+
+def _peek_header(path: str, n=16) -> bytes:
     try:
-        # NLTK 데이터 다운로드
-        try:
-            nltk.data.find('tokenizers/punkt')
-        except LookupError:
-            nltk.download('punkt')
-        
-        # KoNLPy Okt 초기화 (가능한 경우만)
-        if KONLPY_AVAILABLE:
-            okt = Okt()
-            logger.info("KoNLPy Okt 로드 완료")
-        else:
-            logger.warning("KoNLPy를 사용할 수 없습니다. 기본 기능으로 대체됩니다.")
-        
-        # 임베딩 모델 로드 (빠르고 가벼운 모델)
-        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-        logger.info("Sentence Transformer 모델 로드 완료")
+        with open(path, "rb") as f:
+            return f.read(n)
+    except Exception:
+        return b""
+
+
+def _is_riff(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"RIFF"
+    except Exception:
+        return False
+
+
+def ensure_wav(file_path: str) -> str:
+    # 이미 WAV(RIFF)이면 그대로 사용
+    try:
+        with open(file_path, 'rb') as f:
+            if f.read(4) == b'RIFF':
+                return file_path
+    except Exception:
+        pass
+
+    # 변환 경로
+    base, _ = os.path.splitext(file_path)
+    wav_path = base + ".conv.wav"
+
+    # ffmpeg 변환 (16kHz, mono, PCM 16-bit)
+    cmd = ["ffmpeg", "-y", "-i", file_path, "-ar", "16000", "-ac", "1", "-acodec", "pcm_s16le", wav_path]
+    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    # 변환 결과 검증
+    with open(wav_path, 'rb') as f:
+        if f.read(4) != b'RIFF':
+            raise RuntimeError(f"ffmpeg 변환 후에도 WAV가 아닙니다: {wav_path}")
+
+    return wav_path
+
+
+def merge_wav_files(input_files, out_path):
+    """
+    wave 모듈로 WAV 병합 (메모리 절약을 위해 블록 단위로 읽어서 씀)
+    모든 입력 파일의 (channels, sampwidth, framerate, comptype) 동일해야 함
+    """
+    if not input_files:
+        raise ValueError("병합할 WAV 파일이 없습니다.")
+
+
+    print("[merge] input_files:")
+    for p in input_files:
+        size = os.path.getsize(p) if os.path.exists(p) else -1
+        hdr = _peek_header(p, 12)
+        print(f"  - {p} (size={size} bytes, header={hdr})")
+
+     # 1) 기준 파라미터 확보 (첫 파일 오픈에서 에러가 나면 WAV가 아닐 가능성 큼)
+    try:
+        with wave.open(input_files[0], "rb") as w0:
+            nchannels = w0.getnchannels()
+            sampwidth = w0.getsampwidth()
+            framerate = w0.getframerate()
+            comptype = w0.getcomptype()
+            compname = w0.getcompname()
+            print(f"[merge] base params: ch={nchannels}, width={sampwidth}, rate={framerate}, comp={comptype}")
+    except wave.Error as we:
+        # RIFF가 아닌 경우 대부분 여기서 터짐
+        raise HTTPException(status_code=415, detail=f"첫 파일이 WAV가 아닙니다: {input_files[0]} ({we})")
     except Exception as e:
-        logger.error(f"모델 로드 실패: {e}")
+        raise HTTPException(status_code=500, detail=f"첫 파일 오픈 중 예외: {input_files[0]} ({e})")
 
-# 요청/응답 모델 정의
-class TextExtractionRequest(BaseModel):
-    text: str
-    extractKeywords: bool = True
-    extractSentences: bool = True
 
-class TextExtractionResponse(BaseModel):
-    keywords: Optional[List[str]] = None
-    keySentences: Optional[List[str]] = None
-
-class LLMSummarizeRequest(BaseModel):
-    text: str
-
-class LLMSummarizeResponse(BaseModel):
-    summary: str
-
-class TextFilterRequest(BaseModel):
-    text: str
-    similarity_threshold: float = 0.3
-    min_sentence_length: int = 20
-
-class TextFilterResponse(BaseModel):
-    filtered_text: str
-    removed_sentences: int
-    total_sentences: int
-    similarity_scores: Optional[List[float]] = None
-    okt_analysis: Optional[str] = None
-
-# 교육 분야 중요 품사 태그 (명사, 동사, 형용사 중심)
-IMPORTANT_POS_TAGS = {
-    'Noun',      # 명사
-    'Verb',      # 동사  
-    'Adjective', # 형용사
-    'VerbPrefix' # 동사 접두사
-}
-
-# 구어체 표현 패턴 (정규표현식으로 제거할 패턴들)
-COLLOQUIAL_PATTERNS = [
-    r'\b(음|어|아|오|와|헉|어머|아이고)\b',  # 감탄사
-    r'\b(그냥|뭔가|막|좀|진짜|정말|완전|엄청|되게|너무)\s+',  # 구어체 부사
-    r'(.{1,10}?)\1{2,}',  # 반복 표현
-    r'\s+',  # 과도한 공백
-]
-
-# 교육 관련 중요 키워드 패턴 (가중치 부여용)
-EDUCATION_KEYWORD_PATTERNS = [
-    r'(개념|정의|원리|법칙|이론|공식|정리|증명)',
-    r'(예시|사례|문제|해결|방법|과정|단계|절차)',
-    r'(결과|결론|요약|정리|중요|핵심|주요)',
-    r'(기본|기초|응용|활용|실습|연습|복습)',
-    r'(시험|평가|과제|숙제|학습|이해|암기|기억|분석|비교)'
-]
-
-def preprocess_education_text(text: str) -> str:
-    """교육 특화 텍스트 전처리 (구어체 → 문어체) - 개선된 버전"""
-    processed_text = text
-    
-    # 구어체 패턴들을 순차적으로 정리
-    for pattern in COLLOQUIAL_PATTERNS:
-        if pattern == r'\s+':  # 마지막에 공백 정리
-            processed_text = re.sub(pattern, ' ', processed_text)
-        else:
-            processed_text = re.sub(pattern, '', processed_text)
-    
-    return processed_text.strip()
-
-def analyze_morphology_with_okt(text: str) -> List[tuple]:
-    """KoNLPy Okt를 사용한 한국어 형태소 분석"""
-    if not KONLPY_AVAILABLE or not okt:
-        logger.warning("OKT가 사용할 수 없습니다. 기본 단어 분석을 사용합니다.")
-        # 간단한 기본 분석으로 대체
-        words = re.findall(r'[가-힣]{2,}', text)
-        return [(word, 'Noun') for word in words]
-    
+    # 2) 출력 파일 생성
     try:
-        # 텍스트 전처리
-        preprocessed_text = preprocess_education_text(text)
-        
-        # 형태소 분석 및 품사 태깅
-        morphs_with_pos = okt.pos(preprocessed_text, stem=True)
-        
-        # 중요한 품사만 필터링 (명사, 동사, 형용사 등)
-        important_morphs = [
-            (word, pos) for word, pos in morphs_with_pos
-            if pos in IMPORTANT_POS_TAGS and len(word) > 1
-        ]
-        
-        return important_morphs
-        
-    except Exception as e:
-        logger.error(f"형태소 분석 오류: {e}")
-        return []
+        with wave.open(out_path, "wb") as out:
+            out.setnchannels(nchannels)
+            out.setsampwidth(sampwidth)
+            out.setframerate(framerate)
+            out.setcomptype(comptype, compname)
 
-def extract_keywords_with_okt(text: str, top_k: int = 15) -> List[str]:
-    """OKT 기반 키워드 추출 (품사 태깅 활용)"""
-    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
-    
-    # 전체 텍스트에서 형태소 분석
-    all_morphs = analyze_morphology_with_okt(text)
-    
-    if not all_morphs:
-        logger.warning("형태소 분석 결과가 없습니다.")
-        return []
-    
-    # 단어별 빈도 계산 (품사별 가중치 적용)
-    word_freq = Counter()
-    for word, pos in all_morphs:
-        # 품사별 가중치
-        weight = 1.0
-        if pos == 'Noun':
-            weight = 1.5  # 명사 가중치
-        elif pos == 'Verb':
-            weight = 1.3  # 동사 가중치
-        elif pos == 'Adjective':
-            weight = 1.2  # 형용사 가중치
-        
-        # 교육 키워드 추가 가중치
-        for pattern in EDUCATION_KEYWORD_PATTERNS:
-            if re.search(pattern, word):
-                weight *= 1.5
-                break
-        
-        word_freq[word] += weight
-    
-    # 문서 빈도 계산 (DF)
-    doc_freq = Counter()
-    for sentence in sentences:
-        sentence_morphs = analyze_morphology_with_okt(sentence)
-        sentence_words = set([word for word, _ in sentence_morphs])
-        for word in sentence_words:
-            doc_freq[word] += 1
-    
-    # TF-IDF 계산
-    tfidf = {}
-    total_docs = len(sentences)
-    total_words = sum(word_freq.values())
-    
-    for word, freq in word_freq.items():
-        tf = freq / total_words
-        idf = math.log(total_docs / (doc_freq[word] if doc_freq[word] > 0 else 1))
-        tfidf[word] = tf * idf
-    
-    # 상위 키워드 반환
-    sorted_keywords = sorted(tfidf.items(), key=lambda x: x[1], reverse=True)
-    return [word for word, _ in sorted_keywords[:top_k]]
+            # 3) 순서대로 이어붙이기
+            for fpath in input_files:
+                # 빠른 헤더 체크
+                if not _is_riff(fpath):
+                    raise HTTPException(status_code=415, detail=f"RIFF(WAV)가 아닌 파일: {fpath}")
 
-# 기존 함수들도 유지 (호환성)
-def analyze_morphology(text: str) -> List[str]:
-    """기존 형태소 분석 (호환성 유지)"""
-    morphs_with_pos = analyze_morphology_with_okt(text)
-    return [word for word, _ in morphs_with_pos]
+                try:
+                    with wave.open(fpath, "rb") as w:
+                        # 파라미터 일치 검사
+                        if (w.getnchannels() != nchannels or
+                            w.getsampwidth() != sampwidth or
+                            w.getframerate() != framerate or
+                            w.getcomptype() != comptype):
+                            raise HTTPException(
+                                status_code=415,
+                                detail=(f"오디오 파라미터 불일치: {os.path.basename(fpath)} "
+                                        f"(ch={w.getnchannels()}, width={w.getsampwidth()}, "
+                                        f"rate={w.getframerate()}, comp={w.getcomptype()}) "
+                                        f"vs 기준(ch={nchannels}, width={sampwidth}, "
+                                        f"rate={framerate}, comp={comptype})")
+                            )
 
-def extract_keywords(text: str, top_k: int = 15) -> List[str]:
-    """교육 특화 TF-IDF 키워드 추출"""
-    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
-    all_words = analyze_morphology(text)
-    
-    # 단어 빈도 계산 (TF) - 교육 키워드 가중치 적용
-    word_freq = Counter()
-    for word in all_words:
-        weight = 1.5 if word in EDUCATION_KEYWORDS else 1.0
-        word_freq[word] += weight
-    
-    # 문서 빈도 계산 (DF)
-    doc_freq = Counter()
-    for sentence in sentences:
-        sentence_words = set(analyze_morphology(sentence))
-        for word in sentence_words:
-            doc_freq[word] += 1
-    
-    # TF-IDF 계산
-    tfidf = {}
-    total_docs = len(sentences)
-    total_words = len(all_words)
-    
-    for word, freq in word_freq.items():
-        tf = freq / total_words
-        idf = math.log(total_docs / (doc_freq[word] if doc_freq[word] > 0 else 1))
-        tfidf[word] = tf * idf
-    
-    # 상위 키워드 반환
-    sorted_keywords = sorted(tfidf.items(), key=lambda x: x[1], reverse=True)
-    return [word for word, _ in sorted_keywords[:top_k]]
-
-def extract_key_sentences(text: str, top_k: int = 6) -> List[str]:
-    """교육 특화 핵심 문장 추출 (OKT 기반)"""
-    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if len(s.strip()) > 15]
-    keywords = extract_keywords_with_okt(text, 25)
-    keyword_set = set(keywords)
-    
-    # 교육 특화 문장 점수 계산
-    sentence_scores = []
-    for index, sentence in enumerate(sentences):
-        words = analyze_morphology(sentence)
-        keyword_count = sum(1 for word in words if word in keyword_set)
-        
-        # 기본 키워드 점수
-        score = keyword_count / max(len(words), 1)
-        
-        # 교육 특화 가중치
-        if re.search(r'중요|핵심|기본|개념|정의|원리', sentence):
-            score *= 1.3
-        if re.search(r'예를 들어|예시|사례|실습', sentence):
-            score *= 1.2
-        if re.search(r'정리하면|요약하면|결론|마무리', sentence):
-            score *= 1.4
-        if re.search(r'시험|평가|과제', sentence):
-            score *= 1.2
-        
-        # 위치 가중치 (도입부와 마무리 부분 중요)
-        position = index / len(sentences)
-        if position < 0.2 or position > 0.8:
-            score *= 1.1
-        
-        sentence_scores.append({
-            'sentence': sentence,
-            'score': score,
-            'length': len(sentence),
-            'position': index
-        })
-    
-    # 점수순으로 정렬하되, 적절한 길이의 문장만 선별
-    filtered_scores = [
-        item for item in sentence_scores 
-        if 25 < item['length'] < 200
-    ]
-    
-    # 점수순 정렬 후 상위 선택, 원래 순서로 재정렬
-    top_sentences = sorted(filtered_scores, key=lambda x: x['score'], reverse=True)[:top_k]
-    top_sentences.sort(key=lambda x: x['position'])
-    
-    return [item['sentence'] for item in top_sentences]
-
-def tokenize_sentences(text: str) -> List[str]:
-    """문장 분할"""
-    try:
-        sentences = nltk.sent_tokenize(text)
-        return [s.strip() for s in sentences if len(s.strip()) > 10]
-    except Exception as e:
-        logger.warning(f"NLTK 토큰화 실패, 간단한 분할 사용: {e}")
-        return [s.strip() for s in re.split(r'[.!?]+', text) if len(s.strip()) > 10]
-
-def filter_text_by_similarity_with_okt(text: str, similarity_threshold: float = 0.3, min_sentence_length: int = 20) -> Dict[str, Any]:
-    """OKT 기반 개선된 유사도 필터링"""
-    if not embedding_model or not okt:
-        raise HTTPException(status_code=500, detail="모델이 로드되지 않았습니다.")
-    
-    # 문장 분할
-    sentences = tokenize_sentences(text)
-    sentences = [s for s in sentences if len(s) >= min_sentence_length]
-    
-    if len(sentences) < 2:
-        return {
-            "filtered_text": text,
-            "removed_sentences": 0,
-            "total_sentences": len(sentences),
-            "okt_analysis": "문장 수가 부족하여 필터링하지 않음"
-        }
-    
-    try:
-        # 각 문장에서 중요한 형태소만 추출하여 임베딩에 사용
-        processed_sentences = []
-        morphology_info = []
-        
-        for sentence in sentences:
-            # OKT로 형태소 분석
-            morphs = analyze_morphology_with_okt(sentence)
-            important_words = [word for word, pos in morphs if len(word) > 1]
-            
-            # 중요한 단어들로 문장 재구성
-            processed_sentence = ' '.join(important_words) if important_words else sentence
-            processed_sentences.append(processed_sentence)
-            morphology_info.append({
-                "original": sentence,
-                "morphs": morphs,
-                "important_words": important_words
-            })
-        
-        # 처리된 문장들로 임베딩 생성
-        embeddings = embedding_model.encode(processed_sentences)
-        
-        # 전체 중요 키워드 기반 기준 임베딩 생성
-        all_important_words = []
-        for info in morphology_info:
-            all_important_words.extend(info["important_words"])
-        
-        if all_important_words:
-            # 핵심 키워드들의 임베딩을 기준점으로 사용
-            core_keywords = extract_keywords_with_okt(text, 10)
-            reference_text = ' '.join(core_keywords)
-            reference_embedding = embedding_model.encode([reference_text])
-        else:
-            # 평균 임베딩을 기준점으로 사용
-            reference_embedding = np.mean(embeddings, axis=0).reshape(1, -1)
-        
-        # 각 문장과 기준점 간의 유사도 계산
-        similarities = cosine_similarity(embeddings, reference_embedding).flatten()
-        
-        # 임계값 이상의 문장만 선택
-        filtered_indices = [
-            i for i, sim in enumerate(similarities) 
-            if sim >= similarity_threshold
-        ]
-        
-        # 최소 문장 수 보장 (너무 많이 필터링되는 것 방지)
-        min_keep = max(2, int(len(sentences) * 0.4))  # 40% 이상은 보장
-        if len(filtered_indices) < min_keep:
-            # 유사도 순으로 정렬해서 상위 문장들 보장
-            indices_with_sim = [(i, sim) for i, sim in enumerate(similarities)]
-            indices_with_sim.sort(key=lambda x: x[1], reverse=True)
-            filtered_indices = [i for i, _ in indices_with_sim[:min_keep]]
-        
-        # 원래 순서대로 정렬
-        filtered_indices.sort()
-        filtered_sentences = [sentences[i] for i in filtered_indices]
-        
-        return {
-            "filtered_text": " ".join(filtered_sentences),
-            "removed_sentences": len(sentences) - len(filtered_sentences),
-            "total_sentences": len(sentences),
-            "similarity_scores": [float(sim) for sim in similarities],
-            "okt_analysis": f"형태소 분석 완료, 핵심 키워드: {core_keywords[:5] if 'core_keywords' in locals() else '없음'}"
-        }
-        
-    except Exception as e:
-        logger.error(f"OKT 기반 유사도 필터링 오류: {e}")
-        # 오류 시 기존 방식으로 폴백
-        return filter_text_by_similarity(text, similarity_threshold, min_sentence_length)
-
-def filter_text_by_similarity(text: str, similarity_threshold: float = 0.3, min_sentence_length: int = 20) -> Dict[str, Any]:
-    """유사도 기반 텍스트 필터링"""
-    if not embedding_model:
-        raise HTTPException(status_code=500, detail="임베딩 모델이 로드되지 않았습니다.")
-    
-    # 문장 분할
-    sentences = tokenize_sentences(text)
-    sentences = [s for s in sentences if len(s) >= min_sentence_length]
-    
-    if len(sentences) < 2:
-        return {
-            "filtered_text": text,
-            "removed_sentences": 0,
-            "total_sentences": len(sentences)
-        }
-    
-    try:
-        # 문장 임베딩 생성
-        embeddings = embedding_model.encode(sentences)
-        
-        # 전체 텍스트의 평균 임베딩 계산 (기준점)
-        mean_embedding = np.mean(embeddings, axis=0).reshape(1, -1)
-        
-        # 각 문장과 평균 임베딩 간의 유사도 계산
-        similarities = cosine_similarity(embeddings, mean_embedding).flatten()
-        
-        # 임계값 이상의 문장만 선택
-        filtered_sentences = [
-            sentences[i] for i, sim in enumerate(similarities) 
-            if sim >= similarity_threshold
-        ]
-        
-        # 최소 문장 수 보장 (너무 많이 필터링되는 것 방지)
-        if len(filtered_sentences) < max(2, len(sentences) * 0.3):
-            # 유사도 순으로 정렬해서 상위 30% 이상은 보장
-            min_keep = max(2, int(len(sentences) * 0.3))
-            indices_with_sim = [(i, sim) for i, sim in enumerate(similarities)]
-            indices_with_sim.sort(key=lambda x: x[1], reverse=True)
-            filtered_sentences = [sentences[i] for i, _ in indices_with_sim[:min_keep]]
-        
-        return {
-            "filtered_text": " ".join(filtered_sentences),
-            "removed_sentences": len(sentences) - len(filtered_sentences),
-            "total_sentences": len(sentences)
-        }
-        
-    except Exception as e:
-        logger.error(f"유사도 필터링 오류: {e}")
-        # 오류 시 원본 텍스트 반환
-        return {
-            "filtered_text": text,
-            "removed_sentences": 0,
-            "total_sentences": len(sentences)
-        }
-
-@app.post("/api/extract-key-sentences", response_model=TextExtractionResponse)
-async def extract_key_sentences_api(request: TextExtractionRequest):
-    """키워드/문장 추출 API"""
-    try:
-        if not request.text or not request.text.strip():
-            raise HTTPException(status_code=400, detail="텍스트를 입력해주세요.")
-        
-        result = {}
-        
-        if request.extractKeywords:
-            result["keywords"] = extract_keywords_with_okt(request.text, 10)
-        
-        if request.extractSentences:
-            result["keySentences"] = extract_key_sentences(request.text, 3)
-        
-        return TextExtractionResponse(**result)
-        
-    except Exception as e:
-        logger.error(f"키워드/문장 추출 오류: {e}")
-        raise HTTPException(status_code=500, detail="키워드/문장 추출 중 오류가 발생했습니다.")
-
-@app.post("/api/llm-summarize", response_model=LLMSummarizeResponse)
-async def llm_summarize_api(request: LLMSummarizeRequest):
-    """LLM 요약 API"""
-    print("🔥 LLM API 호출됨!")  # 강제 출력
-    logger.info("🔥 LLM API 요청 받음")
-    try:
-        print(f"🔥 요청 텍스트 길이: {len(request.text) if request.text else 0}")
-        logger.info(f"LLM API 요청 받음: {len(request.text) if request.text else 0}자")
-        
-        if not request.text or not request.text.strip():
-            raise HTTPException(status_code=400, detail="요약할 텍스트를 입력해주세요.")
-        
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        logger.info(f"API 키 확인: {bool(openai_api_key)}, 길이: {len(openai_api_key) if openai_api_key else 0}")
-        
-        # API 키가 없으면 더미 응답
-        if not openai_api_key or openai_api_key == "your_openai_api_key_here":
-            summary = f"""📝 **요약 결과**
-
-핵심 내용: {request.text[:80]}...
-
-이 문서는 중요한 정보를 포함하고 있으며, 주요 논점들이 체계적으로 제시되어 있습니다. 전반적으로 유용한 참고 자료로 활용할 수 있을 것으로 판단됩니다.
-
-⚠️ *실제 AI 요약을 사용하려면 .env 파일에 OPENAI_API_KEY를 설정하세요*"""
-            
-            return LLMSummarizeResponse(summary=summary)
-
-        # SSAFY GMS API 또는 OpenAI API 호출
-        is_gms_api_key = openai_api_key.startswith('S13P')  # SSAFY GMS API 키 패턴 수정
-        api_url = ("https://gms.ssafy.io/gmsapi/api.openai.com/v1/chat/completions" 
-                  if is_gms_api_key else "https://api.openai.com/v1/chat/completions")
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                api_url,
-                headers={
-                    "Authorization": f"Bearer {openai_api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": """당신은 교육 전문 요약 AI입니다. 선생님의 1시간 강의 내용을 학생들이 이해하기 쉽게 요약해주세요.
-
-요약 형식:
-📚 **주요 학습 내용**
-- 핵심 개념과 정의
-- 중요한 원리나 법칙
-
-🎯 **핵심 포인트**  
-- 꼭 기억해야 할 내용
-- 시험에 나올 만한 중요 사항
-
-💡 **실습/예시**
-- 구체적인 사례나 예시
-- 실제 적용 방법
-
-📝 **정리**
-- 전체 내용을 한 문장으로 요약
-- 다음 학습과의 연결점"""
-                        },
-                        {
-                            "role": "user",
-                            "content": f"다음은 선생님이 1시간 동안 진행한 수업 내용입니다. 학생들의 학습을 위해 체계적으로 요약해주세요:\n\n{request.text}"
-                        }
-                    ],
-                    "temperature": 0.3,
-                    "max_tokens": 500
-                }
-            )
-        
-        if response.status_code != 200:
-            error_text = response.text
-            logger.error(f"LLM API 오류: {response.status_code} {error_text}")
-            logger.error(f"사용된 API URL: {api_url}")
-            logger.error(f"API 키 패턴: {openai_api_key[:10]}...")
-            raise HTTPException(status_code=500, detail=f"LLM API 호출 실패 (HTTP {response.status_code}): {error_text[:100]}")
-        
-        data = response.json()
-        summary = data.get("choices", [{}])[0].get("message", {}).get("content")
-        
-        if not summary:
-            raise HTTPException(status_code=500, detail="요약 생성에 실패했습니다.")
-        
-        return LLMSummarizeResponse(summary=summary.strip())
-        
+                        # 블록 단위 복사 (frame 단위)
+                        block_frames = 64 * 1024
+                        remaining = w.getnframes()
+                        while remaining > 0:
+                            chunk = min(remaining, block_frames)
+                            data = w.readframes(chunk)
+                            out.writeframes(data)
+                            remaining -= chunk
+                except wave.Error as we:
+                    # 특정 파일에서만 WAV 파싱 오류
+                    raise HTTPException(status_code=415, detail=f"WAV 파싱 실패: {fpath} ({we})")
+                except HTTPException:
+                    # 위에서 상태코드 정해 올린 경우 그대로 던짐
+                    raise
+                except Exception as e:
+                    traceback.print_exc()
+                    raise HTTPException(status_code=500, detail=f"파일 처리 중 예외: {fpath} ({e})")
     except HTTPException:
         raise
     except Exception as e:
-        import traceback
-        logger.error(f"LLM 요약 오류: {e}")
-        logger.error(f"상세 오류: {traceback.format_exc()}")
-        logger.error(f"API 키 존재: {bool(openai_api_key)}")
-        logger.error(f"API 키 패턴: {openai_api_key[:10] if openai_api_key else 'None'}...")
-        raise HTTPException(status_code=500, detail=f"LLM 요약 중 오류: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"출력 파일 작성 중 예외: {out_path} ({e})")
 
-@app.post("/api/filter-text", response_model=TextFilterResponse)
-async def filter_text_api(request: TextFilterRequest):
-    """유사도 기반 텍스트 필터링 API"""
+
+    return out_path
+
+
+def _normalize_base_url(url: str) -> str:
+    """
+    .env에는 base만 있어도 되고, 만약 /recognizer, /recognizer/url, /recognizer/upload가 붙어있으면 떼어낸다.
+    """
+    if not url:
+        raise HTTPException(status_code=500, detail="CLOVA_INVOKE_URL 이 비었습니다.")
+    url = url.strip().rstrip("/")
+    for suf in ("/recognizer/upload", "/recognizer/url", "/recognizer"):
+        if url.endswith(suf):
+            url = url[: -len(suf)]
+            break
+    return url
+
+
+def Start_STT(out_path: str, class_id: str) -> dict:
+    print(f"▶️ [STT] 시작: {out_path} (class_id={class_id})")
+
+    # ../backend/.env 로드
+    env_path = os.path.join(os.path.dirname(__file__), "../backend/.env")
+    print(f"🧩 env 경로: {env_path} exists= {os.path.exists(env_path)}")
+    load_dotenv(env_path)
+
+    raw_url = os.getenv("CLOVA_INVOKE_URL", "")
+    secret  = os.getenv("CLOVA_SECRET_KEY", "")
+
+    # BASE URL 정규화 → /recognizer/upload 붙여 사용
     try:
-        if not request.text or not request.text.strip():
-            raise HTTPException(status_code=400, detail="필터링할 텍스트를 입력해주세요.")
+        base_url = _normalize_base_url(raw_url)
+    except HTTPException as he:
+        return {"ok": False, "detail": he.detail}
+
+    endpoint = base_url + "/recognizer/upload"
+    print("🌐 BASE_URL:", base_url)
+    print("🔚 ENDPOINT:", endpoint)
+    print("🔑 SECRET_KEY head:", (secret[:6] + "…") if secret else "None")
+    print("🌐 BASE_URL raw repr:", repr(base_url))
+    try:
+        part = base_url.split("/external/v1/")[1]
+        app_id, domain_id = part.split("/")[0], part.split("/")[1]
+        print(f"🔎 app_id={app_id}, domain_id={domain_id}")
+    except Exception:
+        pass
+
+    if not secret:
+        return {"ok": False, "detail": "CLOVA_SECRET_KEY 가 비어 있습니다."}
+    if not os.path.isfile(out_path):
+        return {"ok": False, "detail": f"파일 없음: {out_path}"}
+
+    # 파일 헤더/크기 로그
+    hdr12 = _peek_header(out_path, 12)
+    size = os.path.getsize(out_path)
+    print(f"📦 업로드 파일 크기: {size} bytes, 헤더: {hdr12!r}")
+
+    # A 방법: 화자 인식/워드 얼라인먼트 OFF
+    request_body = {
+        "language": "ko-KR",
+        "completion": "sync",
+        "callback": None,
+        "userdata": None,
+        "wordAlignment": False,           # OFF
+        "fullText": True,
+        "forbiddens": None,
+        "boostings": None,
+        "diarization": {"enable": False}, # OFF
+        "sed": None,
+    }
+
+    headers = {
+        "Accept": "application/json;UTF-8",
+        "X-CLOVASPEECH-API-KEY": secret,
+    }
+
+    # 재현용 curl
+    safe_path = out_path.replace("\\", "/")
+    print("🐚 curl 예시:")
+    print(
+        'curl -X POST "{url}" '
+        '-H "X-CLOVASPEECH-API-KEY: {key}" '
+        '-H "Accept: application/json;UTF-8" '
+        '-F "media=@{path}" '
+        '-F "params={params};type=application/json"'
+        .format(url=endpoint, key=(secret[:6] + "…"),
+                path=safe_path, params=json.dumps(request_body, ensure_ascii=False))
+    )
+
+    started = time.time()
+    try:
+        with open(out_path, "rb") as f:
+            files = {
+                # 공식 예제와 동일: 파일 핸들을 그대로 전달
+                "media": f,
+                "params": (None, json.dumps(request_body, ensure_ascii=False).encode("UTF-8"), "application/json"),
+            }
+            resp = requests.post(endpoint, headers=headers, files=files, timeout=600)
+    except requests.Timeout as e:
+        print("⏱️ 타임아웃:", e)
+        return {"ok": False, "detail": f"요청 타임아웃: {e}"}
+    except Exception as e:
+        print("⚠️ 요청 예외:", e)
+        return {"ok": False, "detail": f"요청 실패: {e}"}
+
+    took = time.time() - started
+    ctype = resp.headers.get("content-type", "")
+    print(f"✅ 응답: status={resp.status_code}, content-type={ctype}, took={took:.2f}s")
+    try:
+        print("🔁 resp headers:", dict(resp.headers))
+    except Exception:
+        pass
+    preview = (resp.text or "")[:300].replace("\n", " ")
+    print("📝 응답 미리보기:", preview)
+
+    # 응답 덤프
+    transcript_dir = os.path.dirname(out_path)
+    debug_path = os.path.join(transcript_dir, "stt_response_debug.txt")
+    try:
+        with open(debug_path, "w", encoding="utf-8") as fw:
+            fw.write(f"HTTP {resp.status_code}\nContent-Type: {ctype}\nTook: {took:.2f}s\n\n")
+            fw.write(resp.text or "")
+        print("💾 응답 덤프:", debug_path)
+    except Exception as e:
+        print("⚠️ 응답 덤프 저장 실패:", e)
+
+    # 에러 처리 (메시지 보강)
+    if resp.status_code == 404:
+        hint = "404=경로 미매핑. 같은 도메인의 Invoke URL/Secret Key인지, URL 끝 경로(/recognizer/upload) 확인."
+        return {"ok": False, "detail": f"HTTP 404: {resp.text} | HINT: {hint}"}
+    if resp.status_code in (401, 403):
+        return {"ok": False, "detail": "키/권한 오류. Secret Key/도메인 짝을 확인하세요."}
+    if resp.status_code == 415:
+        return {"ok": False, "detail": "전송 형식 오류. multipart(media/params) 구성 확인."}
+    if resp.status_code == 400:
+        return {"ok": False, "detail": f"요청 파라미터 오류: {resp.text}"}  # (이전 'speaker detect is off' 같은 케이스)
+    if resp.status_code != 200:
+        return {"ok": False, "detail": f"HTTP {resp.status_code}: {resp.text}"}
+
+    # 결과 저장
+    try:
+        data = resp.json()
+        text = data.get("text") or data.get("result") or json.dumps(data, ensure_ascii=False)
+    except Exception:
+        text = resp.text
+    text = (text or "").strip()
+
+    transcript_path = os.path.join(transcript_dir, "transcript.txt")
+    try:
+        with open(transcript_path, "w", encoding="utf-8") as fw:
+            fw.write(text)
+        print("✅ transcript 저장:", transcript_path)
+    except Exception as e:
+        print("⚠️ transcript 저장 실패:", e)
+        return {"ok": True, "text": text, "detail": f"저장 실패: {e}"}
+
+    return {"ok": True, "text": text, "transcript_path": transcript_path}
+
+
+
+def _load_openai_clients():
+    # ../backend/.env 로드
+    env_path = os.path.join(os.path.dirname(__file__), "../backend/.env")
+    if os.path.exists(env_path):
+        load_dotenv(env_path)
+    print("env_path in _load_openai_clients:", env_path)
+
+    use_gms_openai = os.getenv("USE_GMS_OPENAI", "false").lower() == "true"
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+
+    if use_gms_openai:
+        gms_key = os.getenv("GMS_KEY", "").strip()
+        gms_openai_base = os.getenv("GMS_OPENAI_BASE", "").strip().rstrip("/")
+        if not gms_key or not gms_openai_base:
+            raise RuntimeError("USE_GMS_OPENAI=true 인데 GMS_KEY 또는 GMS_OPENAI_BASE 가 비어 있습니다.")
+        # GMS 프록시 경유 (중요: /v1 붙이기)
+        client = OpenAI(api_key=gms_key, base_url=gms_openai_base + "/v1")
+    else:
+        if not openai_key:
+            raise RuntimeError("OPENAI_API_KEY 가 필요합니다.")
+        client = OpenAI(api_key=openai_key)
+
+    clean_model   = os.getenv("OPENAI_CLEAN_MODEL",   "gpt-4o-mini")
+    summary_model = os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4o-mini")
+    return client, clean_model, summary_model
+
+
+def summarize_text_auto(transcript_path: str, out_dir: str) -> dict:
+   
+    try:
+        oai, clean_model, summary_model = _load_openai_clients()
+        env_path = os.path.normpath(os.path.join(os.path.dirname(__file__), "../backend/.env"))
+        if os.path.exists(env_path):
+            load_dotenv(env_path)
+
+        use_claude = os.getenv("USE_GMS_CLAUDE", "false").lower() == "true"
+        gms_key    = os.getenv("GMS_KEY", "").strip()
         
-        result = filter_text_by_similarity_with_okt(
-            request.text, 
-            request.similarity_threshold, 
-            request.min_sentence_length
+        gms_base = os.getenv("GMS_ANTHROPIC_BASE", "https://gms.ssafy.io/gmsapi/api.anthropic.com").rstrip("/")
+        
+        if not os.path.isfile(transcript_path):
+            return {"ok": False, "detail": f"transcript 없음: {transcript_path}"}
+
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+
+        def chunk_text(text: str, max_chars: int):
+            chunks, buf = [], []
+            for line in text.splitlines(keepends=True):
+                if sum(len(x) for x in buf) + len(line) > max_chars and buf:
+                    chunks.append("".join(buf)); buf = []
+                buf.append(line)
+            if buf: chunks.append("".join(buf))
+            return chunks
+
+        def pick_local_font() -> str | None:
+            # 0) ENV가 최우선
+            font_env = os.getenv("PDF_FONT_PATH", "").strip()
+            if font_env and os.path.exists(font_env):
+                return font_env
+
+            # 1) FastAPIProject/fonts (main.py와 같은 폴더)
+            candidates = [
+                os.path.join(HERE, "fonts"),
+                os.path.normpath(os.path.join(HERE, "..", "backend", "fonts")),  # 백엔드 쪽도 fallback
+            ]
+            for d in candidates:
+                if not os.path.isdir(d):
+                    continue
+                # 우선순위로 NotoSansKR-Regular 우선
+                for name in ("NotoSansKR-Regular.ttf", "NotoSansKR-Regular.otf"):
+                    p = os.path.join(d, name)
+                    if os.path.exists(p):
+                        return p
+                # 아무 ttf/otf 하나라도
+                for fn in os.listdir(d):
+                    if fn.lower().endswith((".ttf", ".otf")):
+                        return os.path.join(d, fn)
+            return None
+
+        def markdown_to_pdf(md_text: str, pdf_path: str):
+            font_path = pick_local_font()
+            pdf = FPDF(format="A4", unit="mm")
+            pdf.set_auto_page_break(auto=True, margin=15)
+            pdf.add_page()
+            if font_path and os.path.exists(font_path):
+                pdf.add_font("KR", "", font_path, uni=True)
+                pdf.add_font("KR-B", "", font_path, uni=True)
+                pdf.add_font("KR-Mono", "", font_path, uni=True)
+                base, bold, mono = "KR", "KR-B", "KR-Mono"
+                pdf.set_font(base, size=12)
+            else:
+                base, bold, mono = "Arial", "Arial", "Courier"  # 한글 깨질 수 있음
+                pdf.set_font(base, size=12)
+            in_code = False
+            for raw_line in md_text.splitlines():
+                line = raw_line.rstrip("\n")
+                if line.strip().startswith("```"):
+                    in_code = not in_code
+                    pdf.set_font(mono if in_code else base, size=10 if in_code else 12)
+                    continue
+                if in_code:
+                    pdf.multi_cell(0, 6, txt=line); continue
+                if line.startswith("### "):
+                    pdf.set_font(bold, size=12); pdf.multi_cell(0,7,line[4:].strip()); pdf.set_font(base,12); pdf.ln(1); continue
+                if line.startswith("## "):
+                    pdf.set_font(bold, size=14); pdf.multi_cell(0,8,line[3:].strip()); pdf.set_font(base,12); pdf.ln(1); continue
+                if line.startswith("# "):
+                    pdf.set_font(bold, size=16); pdf.multi_cell(0,9,line[2:].strip()); pdf.set_font(base,12); pdf.ln(1); continue
+                if line.strip().startswith("- "):
+                    pdf.multi_cell(0,6,"• "+line.strip()[2:]); continue
+                if not line.strip():
+                    pdf.ln(1); continue
+                pdf.multi_cell(0,6,line)
+            pdf.output(pdf_path)
+
+        # 1) 전처리(clean) — OpenAI
+        system_clean = (
+            "너는 한국어 전사 텍스트를 정제하는 도우미다. "
+            "원문 의미를 보존하고 환각을 피한다. "
+            "해야 할 일: 문장 경계/문장부호 복원, 띄어쓰기·맞춤법 보정, 중복/잡음 최소화. "
+            "불명확하면 [불명확]로 표기하고 임의로 보충하지 않는다."
         )
-        
-        return TextFilterResponse(**result)
-        
-    except HTTPException:
-        raise
+        o3_max = int(os.getenv("O3_CHUNK_CHARS", "9000"))
+        clean_chunks = []
+        for i, ch in enumerate(chunk_text(raw, o3_max), 1):
+            prompt = (
+                "아래 한국어 텍스트를 의미 왜곡 없이 정리하세요.\n"
+                "- 문장부호/문장 경계 복원, 띄어쓰기/맞춤법 보정\n"
+                "- 명백한 중복/잡음은 간단히 정리(사실 추가/삭제 금지)\n"
+                "- 고유명사가 한국어 음역일 때, 맥락이 명확하면 원어(예: C++)로 복원\n"
+                "- 불명확하면 [불명확] 표기\n\n"
+                f"{ch}"
+
+            )
+            try:
+                resp = oai.responses.create(
+                    model=clean_model,
+                    input=[
+                        {"role":"system","content": system_clean},
+                        {"role":"user","content": prompt}
+                    ],
+                    temperature=0.2,
+                    max_output_tokens=2000,
+                )
+                clean_chunks.append(resp.output_text.strip())
+            except Exception:
+                comp = oai.chat.completions.create(
+                    model=clean_model,
+                    messages=[
+                        {"role":"system","content": system_clean},
+                        {"role":"user","content": prompt}
+                    ],
+                    temperature=0.2,
+                )
+                clean_chunks.append(comp.choices[0].message.content.strip())
+        cleaned = "\n\n".join(clean_chunks)
+        cleaned_path = os.path.join(out_dir, "cleaned.txt")
+        with open(cleaned_path, "w", encoding="utf-8") as fw:
+            fw.write(cleaned)
+
+        # 2) 맵 요약 — OpenAI
+        system_summarize = (
+            
+            
+            "너는 정확한 한국어 필기자다. 환각 없이 핵심을 구조화하고, "
+            "수식은 입력에 실제 언급된 경우에만 ```math 블록을 사용한다."
+        )
+        sum_max = int(os.getenv("OAI_SUMMARY_CHARS", "8000"))
+        map_notes = []
+        for i, ch in enumerate(chunk_text(cleaned, sum_max), 1):
+            prompt = (
+                 "아래 텍스트를 한국어 강의 노트로 요약하세요.\n"
+                "- 핵심 포인트 3~6개 불릿\n"
+                "- 수학/과학/공학 등에서 실제 언급된 공식이 있으면 ```math 블록으로 표기\n"
+                "- 입력에 없는 사실 금지, 불명확하면 [불명확]\n\n"
+                f"{ch}"
+            )
+            try:
+                resp = oai.responses.create(
+                    model=summary_model,
+                    input=[
+                        {"role":"system","content": system_summarize},
+                        {"role":"user","content": prompt}
+                    ],
+                    temperature=0.3,
+                    max_output_tokens=2200,
+                )
+                map_notes.append(resp.output_text.strip())
+            except Exception:
+                comp = oai.chat.completions.create(
+                    model=summary_model,
+                    messages=[
+                        {"role":"system","content": system_summarize},
+                        {"role":"user","content": prompt}
+                    ],
+                    temperature=0.3,
+                )
+                map_notes.append(comp.choices[0].message.content.strip())
+
+        notes_joined = "\n\n---\n\n".join(map_notes)
+
+        # 3) 최종 리듀스 — Claude via GMS (우선)
+        final_md = None
+        if use_claude and gms_key:
+            url = f"{gms_base}/v1/messages"
+            headers = {
+                "Content-Type": "application/json",
+                "x-api-key": gms_key,
+                "anthropic-version": "2023-06-01",
+            }
+            payload = {
+                "model": "claude-3-7-sonnet-latest",
+                "max_tokens": 4500,
+                "system": "너는 한국어 기술 문서 작성자다. 부분 요약들을 하나의 일관된 마크다운 문서로 통합하라. 중복 제거, 용어/표기 통일, 사실 보존, 환각 금지.",
+                "messages": [
+                    {"role": "user", "content":
+                        "다음 '부분 요약 노트'를 통합해 하나의 강의 문서를 만들어라.\n"
+                        "- 섹션: # 요약(5~8문장), ## 핵심 개념(불릿으로 리스트), ## 수식/정의(수학/과학 등 수식이 있는 경우만, ```math)\n"
+                        "- 중복 제거, 용어 일관성 유지, 사실 추가/삭제 금지\n\n"
+                        f"{notes_joined}"
+                    }
+                ],
+            }
+            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=120)
+            if r.status_code == 200:
+                j = r.json()
+                content = j.get("content", [])
+                if content and isinstance(content, list) and isinstance(content[0], dict) and "text" in content[0]:
+                    final_md = content[0]["text"].strip()
+            else:
+                print("[GMS Claude] HTTP", r.status_code, r.text[:200])
+
+        # 폴백 — OpenAI reduce
+        if not final_md:
+            prompt = (
+                "다음 요약 노트 묶음을 하나의 문서로 통합하세요. "
+                "중복 제거, 용어 일관성 유지, 사실추가 금지. "
+                "출력은 Markdown으로 하고 아래 섹션을 포함:\n"
+                "1) 요약(5~8문장)\n"
+                "2) 핵심 개념 리스트\n"
+                "3) 수학, 과학, 공학과 같이 공식이 필요, 언급 되거나 공식이 있으면 설명이 잘 된다면 수식을 표기해줘\n"
+                f"{notes_joined}"
+            )
+            try:
+                resp = oai.responses.create(
+                    model=summary_model,
+                    input=[
+                        {"role":"system","content":
+                         """
+                        내가 한국어로 작성된 방대한 텍스트를 너에게 줄게. 
+                        텍스트 내용은 선생님이 학생들에게 가르친 내용, 즉 수업 내용이야. 
+                        따라서 텍스트는 수학, 언어, 과학, 역사, 경제, 공학 등 초,중,고, 대학교를 포함해 주식, 부동산 등 다양한 내용일 수 있어. 
+                        텍스트는 정말 많은 단어를 포함하고 있기 때문에 나는 텍스트를 잘 요약해서 학생들에게 주고 싶어. 
+                        따라서 텍스트에 있는 수업 내용만을 포함하고, hallucinations를 피하고, 한국어 깔끔한 한국어 Markdown을 작성해줘. 
+                        """},
+                        {"role":"user","content":prompt}
+                    ],
+                    temperature=0.3,
+                    max_output_tokens=3000,
+                )
+                final_md = resp.output_text.strip()
+            except Exception:
+                comp = oai.chat.completions.create(
+                    model=summary_model,
+                    messages=[
+                        {"role":"system","content":"You are a senior Korean technical writer. Merge partial notes into one coherent Markdown document."},
+                        {"role":"user","content":prompt}
+                    ],
+                    temperature=0.3,
+                )
+                final_md = comp.choices[0].message.content.strip()
+
+        # 4) 저장 & PDF
+        summary_md_path  = os.path.join(out_dir, "summary.md")
+        summary_pdf_path = os.path.join(out_dir, "summary.pdf")
+        with open(summary_md_path, "w", encoding="utf-8") as fw:
+            fw.write(final_md)
+
+        try:
+            markdown_to_pdf(final_md, summary_pdf_path)
+        except Exception as pdf_err:
+            # 폰트 등으로 실패해도 PDF 파일은 만든다(내용이 일부 깨질 수 있음)
+            print(f"[PDF] markdown_to_pdf 실패, fallback 실행: {pdf_err}")
+            pdf = FPDF(format="A4", unit="mm")
+            pdf.set_auto_page_break(auto=True, margin=15)
+            pdf.add_page()
+            pdf.set_font("Arial", size=12)
+            for line in final_md.splitlines():
+                pdf.multi_cell(0, 6, line)
+            pdf.output(summary_pdf_path)
+
+        print("✅ summary 저장:", summary_md_path, " / ", summary_pdf_path)
+
+        return {
+            "ok": True,
+            "summary_path": summary_md_path,
+            "summary_pdf_path": summary_pdf_path,
+            "clean_path": cleaned_path,
+        }
+
     except Exception as e:
-        logger.error(f"텍스트 필터링 오류: {e}")
-        raise HTTPException(status_code=500, detail="텍스트 필터링 중 오류가 발생했습니다.")
+        traceback.print_exc()
+        return {"ok": False, "detail": f"summarize_text_auto 실패: {e}"}
 
-@app.get("/")
-async def root():
-    """헬스 체크"""
-    return {"message": "🚀 교육 텍스트 요약 API 서버 실행 중", "status": "ok"}
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port) 
+def send_summary_to_api(class_id: str, md_path: str | None, pdf_path: str | None) -> dict:
+    
+    try:
+        env_path = os.path.join(os.path.dirname(__file__), "../backend/.env")
+        if os.path.exists(env_path):
+            load_dotenv(env_path)
+
+        url = os.getenv("SUMMARY_UPLOAD_URL", "").strip()
+        api_key = os.getenv("SUMMARY_UPLOAD_API_KEY", "").strip()
+        if not url:
+            return {"ok": False, "detail": "SUMMARY_UPLOAD_URL 미설정"}
+
+        headers = {"Accept": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        files = {}
+        if md_path and os.path.isfile(md_path):
+            files["summary_md"] = ("summary.md", open(md_path, "rb"), "text/markdown; charset=utf-8")
+        if pdf_path and os.path.isfile(pdf_path):
+            files["summary_pdf"] = ("summary.pdf", open(pdf_path, "rb"), "application/pdf")
+
+        if not files:
+            return {"ok": False, "detail": "전송할 파일이 없습니다.(md/pdf 없음)"}
+
+        data = {"class_id": str(class_id)}
+        resp = requests.post(url, headers=headers, data=data, files=files, timeout=60)
+
+        # 파일 핸들 닫기
+        for f in files.values():
+            try: f[1].close()
+            except: pass
+
+        if 200 <= resp.status_code < 300:
+            return {"ok": True, "status": resp.status_code, "text": (resp.text or "")[:200]}
+        return {"ok": False, "status": resp.status_code, "text": (resp.text or "")[:200]}
+
+    except Exception as e:
+        return {"ok": False, "detail": f"업로드 실패: {e}"}
+
+def cleanup_class_dir(class_dir: str) -> dict:
+    try:
+        if not os.path.isdir(class_dir):
+            return {"ok": False, "detail": f"디렉토리 없음: {class_dir}"}
+
+        base = os.path.realpath(MERGE_OUT_DIR)
+        target = os.path.realpath(class_dir)
+
+        if os.path.dirname(target) != base:
+            return {"ok": False, "detail": f"허용 경로 아님: {target} (base={base})"}
+
+        shutil.rmtree(target)
+        return {"ok": True, "deleted_dir": target}
+    except Exception as e:
+        return {"ok": False, "detail": f"디렉토리 삭제 실패: {e}"}
+
+def send_summary_to_api(class_id: str, md_path: str | None, pdf_path: str | None) -> dict:
+
+    try:
+        env_path = os.path.join(os.path.dirname(__file__), "../backend/.env")
+        if os.path.exists(env_path):
+            load_dotenv(env_path)
+
+        url_tpl = os.getenv("SUMMARY_UPLOAD_URL", "").strip()
+        api_key = os.getenv("SUMMARY_UPLOAD_API_KEY", "").strip()
+        if not url_tpl:
+            return {"ok": False, "detail": "SUMMARY_UPLOAD_URL 미설정"}
+
+        # 🔹 {class_id}/{classId} 템플릿 치환
+        url = (url_tpl
+               .replace("{class_id}", str(class_id))
+               .replace("{classId}", str(class_id)))
+
+        headers = {"Accept": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"  # 필요 없으면 .env에서 KEY 비워두면 됨
+
+        files = {}
+        if md_path and os.path.isfile(md_path):
+            files["summary_md"] = ("summary.md", open(md_path, "rb"), "text/markdown; charset=utf-8")
+        if pdf_path and os.path.isfile(pdf_path):
+            files["summary_pdf"] = ("summary.pdf", open(pdf_path, "rb"), "application/pdf")
+
+        if not files:
+            return {"ok": False, "detail": "전송할 파일이 없습니다.(md/pdf 없음)"}
+
+        data = {"class_id": str(class_id)}
+        resp = requests.post(url, headers=headers, data=data, files=files, timeout=60)
+
+        # 파일 핸들 닫기
+        for f in files.values():
+            try: f[1].close()
+            except: pass
+
+        if 200 <= resp.status_code < 300:
+            return {"ok": True, "status": resp.status_code, "text": (resp.text or "")[:200]}
+        return {"ok": False, "status": resp.status_code, "text": (resp.text or "")[:200]}
+
+    except Exception as e:
+        return {"ok": False, "detail": f"업로드 실패: {e}"}
+
+
+@app.post("/STT/{class_id}")
+def merge_audio(class_id: str):
+    print("파이썬 merge 합병 처리 -> class_id : ", class_id)
+    """
+    입력:  BASE_AUDIO_DIR/{class_id}/audio_*.wav (없으면 *.wav)
+    출력:  MERGE_OUT_DIR/Merge__{class_id}.wav
+    """
+    in_dir = os.path.join(BASE_AUDIO_DIR, str(class_id))
+    print("in_dir : ", in_dir)
+    if not os.path.isdir(in_dir):
+        raise HTTPException(status_code=400, detail=f"Directory not found: {in_dir}")
+
+
+
+    # 대상 파일 수집
+    patterns = [os.path.join(in_dir, "audio_*.wav"), os.path.join(in_dir, "*.wav")]
+    candidates = []
+    for pat in patterns:
+        candidates.extend(glob.glob(pat))
+    files = sorted(set(candidates), key=_numeric_key)
+
+    if not files:
+        raise HTTPException(status_code=404, detail=f"No WAV files found in {in_dir}")
+
+    
+    class_out_dir = os.path.join(MERGE_OUT_DIR, str(class_id))
+    os.makedirs(class_out_dir, exist_ok=True)
+    out_path = os.path.join(class_out_dir, f"Merge__{class_id}.wav")
+    print("out_path : ", out_path)
+
+    try:
+        wav_ready = [ensure_wav(p) for p in files]
+        
+        for p in wav_ready:
+            size = os.path.getsize(p)
+            with open(p, "rb") as f:
+                hdr = f.read(12)
+            print(f"  - {p} (size={size}, header={hdr})")  # 여기서는 꼭 b'RIFF'가 찍혀야 함
+
+        #1) 음성 파일 Merge
+        merged = merge_wav_files(wav_ready, out_path)
+        print("merged => ", merged)
+        #2) STT
+        stt_result = Start_STT(out_path,class_id)
+        # STT 실패 시 즉시 반환
+        if not stt_result.get("ok"):
+            return {
+                "status": "stt_failed",
+                "message": "STT 실패",
+                "class_id": class_id,
+                "input_dir": in_dir,
+                "files_merged": [os.path.basename(f) for f in files],
+                "output_path": merged,
+                "stt_ok": False,
+                "stt_detail": stt_result.get("detail"),
+                "summary_ok": False,
+                "summary_path": None,
+                "summary_pdf_path": None,
+                "clean_path": None,
+                "summary_detail": "STT 실패로 요약 미수행",
+            }
+
+         # 3) STT 성공 → 요약 실행
+        transcript_path = stt_result.get("transcript_path")
+        if not transcript_path:
+            return {
+                "status": "stt_ok_no_transcript",
+                "message": "STT는 성공했지만 transcript 경로가 없습니다.",
+                "class_id": class_id,
+                "output_path": merged,
+                "stt_ok": True,
+                "transcript_path": None,
+                "summary_ok": False
+            }
+
+        summary_result = summarize_text_auto(transcript_path, os.path.dirname(out_path))
+        
+        upload_result = None
+        cleanup_result = None
+        if (summary_result or {}).get("ok"):
+            upload_result = send_summary_to_api(
+                class_id=class_id,
+                md_path=(summary_result or {}).get("summary_path"),
+                pdf_path=(summary_result or {}).get("summary_pdf_path"),
+            )
+            # 업로드가 성공했을 때만 디렉토리 통째 삭제
+            if upload_result and upload_result.get("ok"):
+                class_out_dir = os.path.join(MERGE_OUT_DIR, str(class_id))
+                cleanup_result = cleanup_class_dir(class_out_dir)
+            else:
+                cleanup_result = {"ok": False, "detail": "업로드 실패로 삭제 건너뜀"}
+
+
+        
+        return {
+            "status": "summary_done" if (summary_result or {}).get("ok") else "summary_failed",
+            "message": "STT 성공 및 요약 처리 완료" if (summary_result or {}).get("ok") else "STT 성공, 요약 실패",
+            "class_id": class_id,
+            "input_dir": in_dir,
+            "files_merged": [os.path.basename(f) for f in files],
+            "output_path": merged,
+            "stt_ok": True,
+            "transcript_path": transcript_path,
+            "stt_detail": stt_result.get("detail"),
+            "summary_ok": (summary_result or {}).get("ok", False),
+            "summary_path": (summary_result or {}).get("summary_path"),
+            "summary_pdf_path": (summary_result or {}).get("summary_pdf_path"),
+            "clean_path": (summary_result or {}).get("clean_path"),
+            "summary_detail": (summary_result or {}).get("detail"),
+            "upload_result": upload_result,
+            "cleanup_result": cleanup_result,
+        }
+        
+
+    except ValueError as ve:
+        # 포맷/파라미터 문제 등
+        raise HTTPException(status_code=415, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Merge failed: {e}")
