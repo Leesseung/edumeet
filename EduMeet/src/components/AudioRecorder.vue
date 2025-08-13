@@ -117,7 +117,7 @@ const chunkTimer = ref(null)
 const hasRecordedData = ref(false)
 
 // 청크 관련
-const CHUNK_DURATION = 10 * 1000 // 5초 (밀리초)
+const CHUNK_DURATION = 60 * 1000 // 5초 (밀리초)
 //const CHUNK_DURATION = 5 * 60 * 1000 // 5분 (밀리초)
 const currentChunk = ref(0)
 const totalChunks = ref(0)

@@ -42,7 +42,7 @@ app.post("/api/class/:classId/start-recording", (req, res) => {
   recordingState.set(classId, {recording:true, paused : false});
   console.log(`[start] class=${classId} -> recording=true, paused=false`);
 
-  res.status(200).json({ message: "녹음 저장 시작 준비 완료" });
+  return res.status(200).json({ message: "녹음 저장 시작 준비 완료" });
 });
 
 
@@ -113,7 +113,7 @@ app.post('/api/class/:classId/update-recording', ensureWritable ,upload.single('
   // 저장 성공
   if (!req.file) return res.status(400).json({ message: "No audio file uploaded." });
   console.log(`✅ 저장됨: /audio/${req.params.classId}/${req.file.filename}`);
-  res.status(200).json({ message: 'Chunk saved successfully.', filename: req.file.filename });
+  return res.status(200).json({ message: 'Chunk saved successfully.', filename: req.file.filename });
 });
 
 
@@ -177,7 +177,6 @@ app.post("/api/class/:classId/stop-recording", async (req, res) => {
       }
     });
 
-    
 
     }catch (e) {
       return res.status(500).json({ error: "서버 내부 오류", detail: String(e) });
