@@ -47,12 +47,17 @@ def _is_riff(path: str) -> bool:
 
 def ensure_wav(file_path: str) -> str:
     # 이미 WAV(RIFF)이면 그대로 사용
+    print("ensure_wav 시작")
     try:
         with open(file_path, 'rb') as f:
             if f.read(4) == b'RIFF':
                 return file_path
     except Exception:
         pass
+
+    # ffmpeg가 없으면 원본 파일 그대로 사용 (임시 해결책)
+    print(f"ffmpeg 없음 - 원본 파일 사용: {file_path}")
+
 
     # 변환 경로
     base, _ = os.path.splitext(file_path)
@@ -753,8 +758,9 @@ def merge_audio(class_id: str):
     print("out_path : ", out_path)
 
     try:
+        print("wav_ready 시작")
         wav_ready = [ensure_wav(p) for p in files]
-        
+        print("wav_ready 완료 ")
         for p in wav_ready:
             size = os.path.getsize(p)
             with open(p, "rb") as f:
