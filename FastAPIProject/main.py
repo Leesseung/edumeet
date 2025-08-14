@@ -625,7 +625,7 @@ def summarize_text_auto(transcript_path: str, out_dir: str) -> dict:
         return {"ok": False, "detail": f"summarize_text_auto 실패: {e}"}
 
 
-def send_summary_to_api(class_id: str, md_path: str | None, pdf_path: str | None) -> dict:
+def send_summary_to_api(class_id: str, meeting_id: str | None, md_path: str | None, pdf_path: str | None) -> dict:
     
     try:
         env_path = os.path.join(os.path.dirname(__file__), "../backend/.env")
@@ -650,7 +650,7 @@ def send_summary_to_api(class_id: str, md_path: str | None, pdf_path: str | None
         if not files:
             return {"ok": False, "detail": "전송할 파일이 없습니다.(md/pdf 없음)"}
 
-        data = {"class_id": str(class_id)}
+        data = {"class_id": str(class_id), "meeting_id": meeting_id}
         resp = requests.post(url, headers=headers, data=data, files=files, timeout=60)
 
         # 파일 핸들 닫기
@@ -681,7 +681,7 @@ def cleanup_class_dir(class_dir: str) -> dict:
     except Exception as e:
         return {"ok": False, "detail": f"디렉토리 삭제 실패: {e}"}
 
-def send_summary_to_api(class_id: str, md_path: str | None, pdf_path: str | None) -> dict:
+def send_summary_to_api(class_id: str, meeting_id: str | None, md_path: str | None, pdf_path: str | None) -> dict:
 
     try:
         env_path = os.path.join(os.path.dirname(__file__), "../backend/.env")
@@ -711,7 +711,7 @@ def send_summary_to_api(class_id: str, md_path: str | None, pdf_path: str | None
         if not files:
             return {"ok": False, "detail": "전송할 파일이 없습니다.(md/pdf 없음)"}
 
-        data = {"class_id": str(class_id)}
+        data = {"class_id": str(class_id), "meeting_id": meeting_id}
         resp = requests.post(url, headers=headers, data=data, files=files, timeout=60)
 
         # 파일 핸들 닫기
@@ -728,8 +728,19 @@ def send_summary_to_api(class_id: str, md_path: str | None, pdf_path: str | None
 
 
 @app.post("/STT/{class_id}")
-def merge_audio(class_id: str):
+def merge_audio(class_id: str, request: dict):
     print("파이썬 merge 합병 처리 -> class_id : ", class_id)
+    
+    # server.js에서 전달받은 데이터 추출
+    meeting_id = request.get("meeting_id")
+    total_chunks = request.get("total_chunks")
+    generate_summary = request.get("generate_summary")
+    
+    print("📝 FastAPI에서 받은 데이터:")
+    print("- class_id:", class_id)
+    print("- meeting_id:", meeting_id)
+    print("- total_chunks:", total_chunks)
+    print("- generate_summary:", generate_summary)
     """
     입력:  BASE_AUDIO_DIR/{class_id}/audio_*.wav (없으면 *.wav)
     출력:  MERGE_OUT_DIR/Merge__{class_id}.wav
@@ -810,6 +821,7 @@ def merge_audio(class_id: str):
         if (summary_result or {}).get("ok"):
             upload_result = send_summary_to_api(
                 class_id=class_id,
+                meeting_id=meeting_id,  # meeting_id 추가
                 md_path=(summary_result or {}).get("summary_path"),
                 pdf_path=(summary_result or {}).get("summary_pdf_path"),
             )
@@ -826,6 +838,7 @@ def merge_audio(class_id: str):
             "status": "summary_done" if (summary_result or {}).get("ok") else "summary_failed",
             "message": "STT 성공 및 요약 처리 완료" if (summary_result or {}).get("ok") else "STT 성공, 요약 실패",
             "class_id": class_id,
+            "meeting_id": meeting_id,  # meeting_id 추가
             "input_dir": in_dir,
             "files_merged": [os.path.basename(f) for f in files],
             "output_path": merged,
