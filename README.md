@@ -1,7 +1,7 @@
 # EduMeet - AI 기반 교육 플랫폼 (Frontend)
 
 <div align="center">
-  <img src="src/assets/edumeet_logo.png" alt="EduMeet Logo" width="200"/>
+  <img src="EduMeet/src/assets/edumeet_logo.png" alt="EduMeet Logo" width="200"/>
   
   [![Vue.js](https://img.shields.io/badge/Vue.js-3.5.17-4FC08D?style=for-the-badge&logo=vue.js&logoColor=white)](https://vuejs.org/)
   [![Vite](https://img.shields.io/badge/Vite-7.0.0-646CFF?style=for-the-badge&logo=vite&logoColor=white)](https://vitejs.dev/)
